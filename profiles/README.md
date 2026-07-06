@@ -16,6 +16,8 @@ Profile layout:
 profiles/
   templates/
   qwen27b/
+    experimental/
+      int4/
     normal/
       fp8/
       int4/
@@ -51,8 +53,11 @@ if you need to run without a reasoning parser for diagnostics.
 File names describe the intended route:
 
 ```text
-<kv-precision>-<context>-<mtp>-<message-type>.env
+<kv-precision>-<context>-<speculative>-<message-type>.env
 ```
+
+The speculative slot is typically `nomtp`, `mtp3`, or an experimental draft
+lane such as `dflash8`.
 
 KV positioning:
 
@@ -67,6 +72,10 @@ KV positioning:
 The shipped TQK8V4 profiles use `MAX_BATCHED_TOKENS=2560`, which is the
 validated setting for the prefix-cache path with aligned Qwen hybrid cache
 blocks.
+
+Experimental profiles may exist outside the validated tables below. They are
+kept as launchable presets only and are not promoted deployment routes until
+capacity and throughput evidence is published.
 
 ## Validated Profiles
 

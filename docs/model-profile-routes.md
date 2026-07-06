@@ -32,7 +32,9 @@ are not capacity evidence.
 
 ## Notes
 
-- Profiles are organized as `profiles/<model>/<mode>/<weight>/<route>.env`.
+- Validated profiles are organized as `profiles/<model>/<mode>/<weight>/<route>.env`.
+  Experimental launch-only presets may also live under
+  `profiles/<model>/experimental/<weight>/`.
 - `normal` is the current recommended production route. `fast` keeps only
   high-performance routes that passed quality smoke. `safe` is the launcher
   eager fallback mode, not the current shipped profile directory.

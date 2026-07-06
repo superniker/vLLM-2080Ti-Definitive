@@ -15,6 +15,8 @@ parallel size 2。
 profiles/
   templates/
   qwen27b/
+    experimental/
+      int4/
     normal/
       fp8/
       int4/
@@ -49,8 +51,11 @@ reasoning parser，让启动 smoke 和聊天解析都跟模型默认 reasoning �
 文件名描述路线：
 
 ```text
-<kv-precision>-<context>-<mtp>-<message-type>.env
+<kv-precision>-<context>-<speculative>-<message-type>.env
 ```
+
+其中 speculative 这一段通常写成 `nomtp`、`mtp3`，或 `dflash8`
+这类实验性 draft 路线名。
 
 KV 精度定位：
 
@@ -61,6 +66,9 @@ KV 精度定位：
 
 内置 TQK8V4 profile 使用 `MAX_BATCHED_TOKENS=2560`，这是 Qwen hybrid cache
 block 对齐后的 prefix-cache 路径已验证设置。
+
+实验性 profile 可能不会列入下面的已验证表格。它们只作为可启动预设保留，在补齐
+容量和吞吐证据前不作为正式推荐部署路线。
 
 ## 已验证 Profile
 

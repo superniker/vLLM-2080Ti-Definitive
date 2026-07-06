@@ -4,7 +4,7 @@
 
 import math
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from functools import cached_property
 from typing import ClassVar, NamedTuple
 
@@ -37,6 +37,7 @@ from vllm.v1.attention.backend import (
     CommonAttentionMetadata,
     MultipleOf,
 )
+from vllm.v1.attention.backends.utils import get_kv_cache_layout
 from vllm.v1.kv_cache_interface import AttentionSpec, EncoderOnlyAttentionSpec
 
 logger = init_logger(__name__)
@@ -46,6 +47,10 @@ create_block_mask_compiled = torch.compile(
     create_block_mask, fullgraph=True, mode="reduce-overhead"
 )
 flex_attention_compiled = torch.compile(flex_attention, fullgraph=True)
+
+
+def _is_power_of_two(value: int) -> bool:
+    return value > 0 and (value & (value - 1)) == 0
 
 
 def _offsets_to_doc_ids_tensor(
@@ -125,7 +130,26 @@ class FlexAttentionBackend(AttentionBackend):
         head_size: int,
         cache_dtype_str: str = "auto",
     ) -> tuple[int, ...]:
-        return (2, num_blocks, block_size, num_kv_heads, head_size)
+        return (num_blocks, 2, block_size, num_kv_heads, head_size)
+
+    @staticmethod
+    def get_kv_cache_stride_order(
+        include_num_layers_dimension: bool = False,
+    ) -> tuple[int, ...]:
+        cache_layout = get_kv_cache_layout()
+        if cache_layout == "NHD" and include_num_layers_dimension:
+            return (1, 0, 2, 3, 4, 5)
+        if cache_layout == "NHD":
+            # Keep the logical view as [num_blocks, 2, block_size, ...] while
+            # placing the K/V selector first in physical memory. This makes
+            # kv_cache.unbind(1) produce contiguous per-token K/V pages for the
+            # decoder fast-path and avoids correctness-only compaction on NHD.
+            return (1, 0, 2, 3, 4)
+        if cache_layout == "HND" and include_num_layers_dimension:
+            return (1, 2, 4, 0, 3, 5)
+        if cache_layout == "HND":
+            return (0, 1, 3, 2, 4)
+        raise ValueError(f"Unknown cache layout: {cache_layout}")
 
     @staticmethod
     def get_builder_cls() -> type["FlexAttentionMetadataBuilder"]:
@@ -251,6 +275,79 @@ def physical_to_logical_mapping(
     # NB - Seems like block 0 is always empty so we reset it manually
     physical_to_logical[:, 0] = -1
     return physical_to_logical
+
+
+def compact_interleaved_paged_kv(
+    key_cache: torch.Tensor,
+    value_cache: torch.Tensor,
+    attn_metadata: "FlexAttentionMetadata",
+    num_kv_heads: int,
+    head_size: int,
+) -> tuple[torch.Tensor, torch.Tensor, "FlexAttentionMetadata"]:
+    """Compact only the live physical KV pages for interleaved KV layouts.
+
+    Some runtimes allocate paged KV as [num_blocks, 2, block_size, ...], which
+    makes the K/V views non-contiguous after unbinding the KV axis. Flex
+    attention still needs token-major K/V tensors, so for correctness we gather
+    the live physical pages for the current batch into a dense page space and
+    rebuild the metadata to match that dense layout.
+    """
+    block_table = attn_metadata.block_table[: attn_metadata.num_reqs]
+    max_blocks_per_req = block_table.shape[1]
+    device = block_table.device
+    valid_block_mask = (
+        torch.arange(max_blocks_per_req, device=device).unsqueeze(0)
+        < attn_metadata.num_blocks_per_seq.unsqueeze(1)
+    )
+    live_physical_blocks = torch.unique(
+        block_table.masked_select(valid_block_mask).to(torch.long), sorted=True
+    )
+    if live_physical_blocks.numel() == 0:
+        return (
+            key_cache.reshape(-1, num_kv_heads, head_size),
+            value_cache.reshape(-1, num_kv_heads, head_size),
+            attn_metadata,
+        )
+
+    dense_lookup = torch.full(
+        (key_cache.shape[0],), -1, dtype=torch.long, device=device
+    )
+    dense_lookup[live_physical_blocks] = torch.arange(
+        live_physical_blocks.numel(), device=device, dtype=torch.long
+    )
+
+    dense_block_table = torch.zeros_like(block_table)
+    dense_block_table[valid_block_mask] = dense_lookup[
+        block_table[valid_block_mask].to(torch.long)
+    ].to(block_table.dtype)
+
+    dense_physical_to_logical = physical_to_logical_mapping(
+        dense_block_table,
+        attn_metadata.seq_lens,
+        attn_metadata.block_size,
+        int(live_physical_blocks.numel()),
+    )
+    dense_total_cache_tokens = (
+        int(live_physical_blocks.numel()) * attn_metadata.block_size
+    )
+    dense_metadata = replace(
+        attn_metadata,
+        block_table=dense_block_table,
+        physical_to_logical=dense_physical_to_logical,
+        total_cache_tokens=dense_total_cache_tokens,
+        block_mask=None,
+        direct_build=False,
+        q_block_size=128,
+        kv_block_size=128,
+    )
+
+    key_cache = key_cache.index_select(0, live_physical_blocks).reshape(
+        -1, num_kv_heads, head_size
+    )
+    value_cache = value_cache.index_select(0, live_physical_blocks).reshape(
+        -1, num_kv_heads, head_size
+    )
+    return key_cache, value_cache, dense_metadata
 
 
 def unique_static_unsorted(
@@ -768,9 +865,15 @@ class FlexAttentionMetadataBuilder(AttentionMetadataBuilder[FlexAttentionMetadat
         self.block_size = kv_cache_spec.block_size
         self.kv_cache_spec = kv_cache_spec
         supports_small_blocks = is_torch_equal_or_newer("2.9.0.dev0")
-        self.direct_build: bool = supports_small_blocks
-        self.q_block_size: int = 16 if supports_small_blocks else 128
-        self.kv_block_size: int = self.block_size if supports_small_blocks else 128
+        # Direct BlockMask lowering feeds kv_block_size into Triton arange(),
+        # which currently requires a power-of-two span. Hybrid Mamba/GDN
+        # routes can align attention blocks to values like 800, so keep those
+        # on the generic 128x128 block-mask path instead of crashing at smoke.
+        self.direct_build: bool = supports_small_blocks and _is_power_of_two(
+            self.block_size
+        )
+        self.q_block_size: int = 16 if self.direct_build else 128
+        self.kv_block_size: int = self.block_size if self.direct_build else 128
 
         self.max_model_len = self.model_config.max_model_len
         max_num_seqs = vllm_config.scheduler_config.max_num_seqs
@@ -1005,7 +1108,7 @@ class FlexAttentionImpl(AttentionImpl):
         if self.attn_type == AttentionType.ENCODER_ONLY:
             return
 
-        key_cache, value_cache = kv_cache.unbind(0)
+        key_cache, value_cache = kv_cache.unbind(1)
         torch.ops._C_cache_ops.reshape_and_cache_flash(
             key,
             value,
@@ -1036,7 +1139,7 @@ class FlexAttentionImpl(AttentionImpl):
             key: shape = [num_tokens, num_kv_heads, head_size]
             value: shape = [num_tokens, num_kv_heads, head_size]
             kv_cache: shape =
-                [2, num_blocks, block_size, num_kv_heads, head_size]
+                [num_blocks, 2, block_size, num_kv_heads, head_size]
             attn_metadata: Metadata for attention.
         Returns:
             shape = [num_tokens, num_heads * head_size]
@@ -1055,6 +1158,28 @@ class FlexAttentionImpl(AttentionImpl):
             # return torch.empty_like(query)
 
         num_actual_tokens = attn_metadata.num_actual_tokens
+
+        decoder_key_cache: torch.Tensor | None = None
+        decoder_value_cache: torch.Tensor | None = None
+        if self.attn_type == AttentionType.DECODER:
+            key_cache, value_cache = kv_cache.unbind(1)
+            if key_cache.is_contiguous() and value_cache.is_contiguous():
+                decoder_key_cache = key_cache.view(
+                    -1, self.num_kv_heads, self.head_size
+                )
+                decoder_value_cache = value_cache.view(
+                    -1, self.num_kv_heads, self.head_size
+                )
+            else:
+                decoder_key_cache, decoder_value_cache, attn_metadata = (
+                    compact_interleaved_paged_kv(
+                        key_cache,
+                        value_cache,
+                        attn_metadata,
+                        self.num_kv_heads,
+                        self.head_size,
+                    )
+                )
 
         needs_rebuild_block_mask = False
         if attn_metadata.sliding_window != self.sliding_window:
@@ -1110,14 +1235,11 @@ class FlexAttentionImpl(AttentionImpl):
 
         else:
             assert self.attn_type == AttentionType.DECODER
-            key_cache, value_cache = kv_cache.unbind(0)
-
-            # View out the block_size dim
-            key_cache = key_cache.view(-1, self.num_kv_heads, self.head_size)
-            value_cache = value_cache.view(-1, self.num_kv_heads, self.head_size)
+            assert decoder_key_cache is not None
+            assert decoder_value_cache is not None
             query, key_tensor, value_tensor = map(
                 lambda x: self.view_as_4d(x).permute(0, 2, 1, 3),
-                (query, key_cache, value_cache),
+                (query, decoder_key_cache, decoder_value_cache),
             )
 
             query = query[:, :, :num_actual_tokens, :]

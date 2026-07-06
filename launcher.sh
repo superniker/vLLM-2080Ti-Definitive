@@ -281,6 +281,55 @@ read_profile_value() {
   ' "$file"
 }
 
+json_config_field() {
+  local payload=$1
+  local field=$2
+
+  python3 - "$field" "$payload" <<'PY'
+import json
+import sys
+
+field = sys.argv[1]
+payload = sys.argv[2]
+
+try:
+    data = json.loads(payload)
+except json.JSONDecodeError as exc:
+    print(f"invalid speculative JSON: {exc}", file=sys.stderr)
+    raise SystemExit(2)
+
+value = data.get(field)
+if value is None:
+    raise SystemExit(0)
+if isinstance(value, bool):
+    print("1" if value else "0")
+else:
+    print(value)
+PY
+}
+
+effective_speculative_tokens() {
+  local tokens
+
+  if [[ -n "${SPECULATIVE_CONFIG:-}" ]]; then
+    tokens=$(json_config_field "$SPECULATIVE_CONFIG" num_speculative_tokens 2>/dev/null || true)
+    if [[ "$tokens" =~ ^[0-9]+$ ]] && (( tokens > 0 )); then
+      printf '%s\n' "$tokens"
+      return 0
+    fi
+    printf '0\n'
+    return 0
+  fi
+
+  tokens=${MTP_K:-0}
+  if [[ "$tokens" =~ ^[0-9]+$ ]] && (( tokens > 0 )); then
+    printf '%s\n' "$tokens"
+    return 0
+  fi
+
+  printf '0\n'
+}
+
 ROUTE_PROFILE_KEYS=(
   SERVED_NAME
   COMPATIBLE_MODES
@@ -2924,7 +2973,9 @@ build_args() {
   fi
   [[ -n "${CHAT_TEMPLATE_FILE:-}" ]] && VLLM_ARGS+=(--chat-template "$CHAT_TEMPLATE_FILE")
 
-  local capture=$((MTP_K + 1))
+  local spec_tokens capture
+  spec_tokens=$(effective_speculative_tokens)
+  capture=$((spec_tokens + 1))
   if [[ -n "${SPECULATIVE_CONFIG:-}" ]]; then
     VLLM_ARGS+=(--speculative-config "$SPECULATIVE_CONFIG")
   elif (( MTP_K > 0 )); then
@@ -2953,7 +3004,7 @@ build_args() {
 
   if [[ -n "${COMPILATION_CONFIG_JSON:-}" ]]; then
     VLLM_ARGS+=(--compilation-config "$COMPILATION_CONFIG_JSON")
-  elif [[ -n "${SPECULATIVE_CONFIG:-}" || "$MTP_K" -gt 0 ]]; then
+  elif [[ -n "${SPECULATIVE_CONFIG:-}" || "$spec_tokens" -gt 0 ]]; then
     VLLM_ARGS+=(--compilation-config "{\"cudagraph_mode\":\"${cudagraph_mode}\",\"cudagraph_capture_sizes\":[${capture}],\"max_cudagraph_capture_size\":${capture}}")
   else
     VLLM_ARGS+=(--compilation-config "{\"cudagraph_mode\":\"${cudagraph_mode}\",\"cudagraph_capture_sizes\":[1],\"max_cudagraph_capture_size\":1}")

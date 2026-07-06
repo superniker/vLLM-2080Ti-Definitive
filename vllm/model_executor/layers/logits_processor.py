@@ -108,6 +108,7 @@ class LogitsProcessor(PluggableLayer):
         lm_head: VocabParallelEmbedding,
         hidden_states: torch.Tensor,
         embedding_bias: torch.Tensor | None = None,
+        disallowed_token_ids_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Vocab-parallel argmax without all-gathering full logits.
 
@@ -127,6 +128,26 @@ class LogitsProcessor(PluggableLayer):
             logits = torch.tanh(logits / self.soft_cap) * self.soft_cap
         if self.scale != 1.0:
             logits = logits * self.scale
+
+        if disallowed_token_ids_mask is not None:
+            if disallowed_token_ids_mask.shape[0] != hidden_states.shape[0]:
+                raise ValueError(
+                    "disallowed_token_ids_mask batch does not match hidden states."
+                )
+            shard_indices = lm_head.shard_indices
+            shard_mask = disallowed_token_ids_mask[
+                :,
+                shard_indices.org_vocab_start_index : shard_indices.org_vocab_end_index,
+            ]
+            if shard_mask.shape[1] != logits.shape[-1]:
+                padded_mask = torch.ones(
+                    (shard_mask.shape[0], logits.shape[-1]),
+                    dtype=torch.bool,
+                    device=logits.device,
+                )
+                padded_mask[:, : shard_mask.shape[1]] = shard_mask
+                shard_mask = padded_mask
+            logits.masked_fill_(shard_mask, float("-inf"))
 
         # Mask out padding entries beyond org_vocab_size on this shard.
         num_pad = lm_head.shard_indices.num_org_vocab_padding
