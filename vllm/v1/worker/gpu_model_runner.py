@@ -63,6 +63,7 @@ from vllm.model_executor.layers.fused_moe.routed_experts_capturer import (
 from vllm.model_executor.layers.mamba.ops.ssu_dispatch import (
     initialize_mamba_ssu_backend,
 )
+from vllm.model_executor.layers.mamba.mamba_utils import is_conv_state_dim_first
 from vllm.model_executor.layers.rotary_embedding import (
     MRotaryEmbedding,
     XDRotaryEmbedding,
@@ -980,6 +981,7 @@ class GPUModelRunner(
                 device=self.device,
                 with_postprocess_align=(
                     self.speculative_config is not None and self.model_config.is_hybrid
+                    and not is_conv_state_dim_first()
                 ),
             )
         return self._mamba_bufs
@@ -1481,10 +1483,12 @@ class GPUModelRunner(
 
         if self.cache_config.mamba_cache_mode == "align":
             mamba_bufs = self._get_mamba_bufs()
-            if self.sm75_spec_syncs_enabled:
+            if self.sm75_spec_syncs_enabled or mamba_bufs.postprocess_align is None:
                 # On SM75 safe-sync routes, keep the older CPU-side postprocess
                 # path until the fused GPU align postprocess is proven stable
-                # for hybrid speculative decoding workloads.
+                # for hybrid speculative decoding workloads. DS conv-state
+                # layout also falls back here because the fused path cannot
+                # safely slice shifted conv windows yet.
                 accepted = self.num_accepted_tokens.gpu[:num_reqs].cpu().numpy()
                 self.input_batch.num_accepted_tokens_cpu[:num_reqs] = accepted
                 mamba_utils.postprocess_mamba(
@@ -5104,7 +5108,7 @@ class GPUModelRunner(
                 # residual stream is appended to aux outputs, while Eagle-style
                 # aux collection is 1-based over the emitted hidden-state slots.
                 layer_ids = [layer_id + 1 for layer_id in target_layer_ids]
-            if eagle_config and isinstance(eagle_config, dict):
+            elif eagle_config and isinstance(eagle_config, dict):
                 layer_ids = eagle_config.get("eagle_aux_hidden_state_layer_ids")
 
         if layer_ids and isinstance(layer_ids, (list, tuple)):

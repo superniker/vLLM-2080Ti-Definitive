@@ -92,6 +92,7 @@ class DFlashAttention(Attention):
                 num_kv_heads=spec.num_kv_heads,
                 head_size=spec.head_size,
                 head_size_v=getattr(spec, "head_size_v", spec.head_size),
+                sliding_window=spec.sliding_window,
                 dtype=spec.dtype,
                 kv_quant_mode=spec.kv_quant_mode,
                 page_size_padded=spec.page_size_padded,

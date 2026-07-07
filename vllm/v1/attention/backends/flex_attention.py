@@ -174,6 +174,8 @@ def physical_to_logical_mapping(
     seq_lens: torch.Tensor,
     block_size: int,
     total_blocks: int,
+    *,
+    reset_block_zero: bool = True,
 ) -> torch.Tensor:
     """
     Creates an inverse mapping from physical block locations to logical indices.
@@ -272,8 +274,9 @@ def physical_to_logical_mapping(
     physical_to_logical.scatter_reduce_(
         -1, valid_block_table.to(torch.int64), valid_logical_indices, reduce="amax"
     )
-    # NB - Seems like block 0 is always empty so we reset it manually
-    physical_to_logical[:, 0] = -1
+    if reset_block_zero:
+        # Some paged-KV layouts reserve physical block 0 as empty.
+        physical_to_logical[:, 0] = -1
     return physical_to_logical
 
 
@@ -326,6 +329,7 @@ def compact_interleaved_paged_kv(
         attn_metadata.seq_lens,
         attn_metadata.block_size,
         int(live_physical_blocks.numel()),
+        reset_block_zero=False,
     )
     dense_total_cache_tokens = (
         int(live_physical_blocks.numel()) * attn_metadata.block_size

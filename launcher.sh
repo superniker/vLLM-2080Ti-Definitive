@@ -310,9 +310,16 @@ PY
 
 effective_speculative_tokens() {
   local tokens
+  local status
 
   if [[ -n "${SPECULATIVE_CONFIG:-}" ]]; then
-    tokens=$(json_config_field "$SPECULATIVE_CONFIG" num_speculative_tokens 2>/dev/null || true)
+    set +e
+    tokens=$(json_config_field "$SPECULATIVE_CONFIG" num_speculative_tokens 2>/dev/null)
+    status=$?
+    set -e
+    if (( status == 2 )); then
+      die "SPECULATIVE_CONFIG contains invalid JSON."
+    fi
     if [[ "$tokens" =~ ^[0-9]+$ ]] && (( tokens > 0 )); then
       printf '%s\n' "$tokens"
       return 0
@@ -328,6 +335,20 @@ effective_speculative_tokens() {
   fi
 
   printf '0\n'
+}
+
+validate_speculative_config() {
+  local status
+
+  [[ -n "${SPECULATIVE_CONFIG:-}" ]] || return 0
+
+  set +e
+  json_config_field "$SPECULATIVE_CONFIG" num_speculative_tokens >/dev/null 2>&1
+  status=$?
+  set -e
+  if (( status == 2 )); then
+    die "SPECULATIVE_CONFIG contains invalid JSON."
+  fi
 }
 
 ROUTE_PROFILE_KEYS=(
@@ -3656,6 +3677,7 @@ prepare_runtime_defaults() {
   SERVICE_SCOPE=${SERVICE_SCOPE:-local}
   normalize_message_type_defaults
   apply_prefix_cache_defaults
+  validate_speculative_config
   ENABLE_AUTO_TOOL_CHOICE=$(normalize_bool "${ENABLE_AUTO_TOOL_CHOICE:-0}")
   apply_family_reasoning_defaults
   if [[ "$ENABLE_AUTO_TOOL_CHOICE" == "1" ]]; then
