@@ -103,3 +103,17 @@ llmfan46/Qwen3.6-27B-uncensored-heretic-v2-Native-MTP-Preserved-GPTQ-Int4，
 | `qwen27b/fast/int4/fp16kv-256K-mtp3-text-only.env` | fast | 256K | FP16 | 3 | text-only | 1 | 1734.98 / 87.00 |
 | `qwen27b/fast/int4/tqk8v4-256K-mtp3-text-only.env` | fast | 256K | TQK8V4 | 3 | text-only | 1 | 1744.67 / 100.81 |
 | `qwen27b/fast/int4/tqk8v4-two250K-mtp3-text-only.env` | fast | 每工作区 250K | TQK8V4 | 3 | text-only | 2 | 1739.23 / 99.91 |
+
+## 最近一次 INT8KV 4K 参考数据
+
+下面这组短测数据是对上面大上下文条目的补充。本轮按仓库既定的
+`PP4096/TG128` 单请求合成口径，重新验证了当前正式保留的 `normal` INT8KV
+路线。
+
+| Profile | 测试口径 | 吞吐性能 | 说明 |
+|---|---|---:|---|
+| `qwen27b/normal/fp8/int8kv-252K-mtp3-text-only.env` | PP4096/TG128 | 1557.20 / 73.79 | 当前正式 FP8 INT8KV `normal` 参考值。 |
+| `qwen27b/normal/int4/int8kv-two250K-mtp3-text-only.env` | PP4096/TG128 | 1684.19 / 69.53 | 当前正式 GPTQ-INT4 INT8KV `normal` 参考值。 |
+| `qwen27b/normal/int4/int8kv-512K-yarn-mtp3-text-only.env` | PP4096/TG128 | 1679.50 / 41.83 | 当前正式 GPTQ-INT4 INT8KV + YaRN `normal` 参考值。 |
+
+这组短测只用于补充上面主表里的长上下文验证数据，不替代原有的长上下文容量证据。

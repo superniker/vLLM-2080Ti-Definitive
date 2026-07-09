@@ -70,11 +70,23 @@ _INT8KV_FA_CONTINUATION_MAX_TOKENS = int(
 _INT8KV_FA_CONTINUATION_MIN_Q = int(
     os.getenv("VLLM_INT8KV_FA_CONTINUATION_MIN_Q", "128")
 )
+_INT8KV_FA_CONTINUATION_INCREMENTAL_REUSE = (
+    os.getenv("VLLM_INT8KV_FA_CONTINUATION_INCREMENTAL_REUSE", "0") == "1"
+)
+_INT8KV_FA_CONTINUATION_FP16_DEQUANT = (
+    os.getenv("VLLM_INT8KV_FA_CONTINUATION_FP16_DEQUANT", "0") == "1"
+)
 _INT8KV_FA_CASCADE_DEQUANT = os.getenv(
     "VLLM_INT8KV_FA_CASCADE_DEQUANT", "0"
 ) == "1"
 _INT8KV_FA_CASCADE_TILE_TOKENS = int(
     os.getenv("VLLM_INT8KV_FA_CASCADE_TILE_TOKENS", "65536")
+)
+_INT8KV_FA_CONTINUATION_WORKSPACE_BYTES = int(
+    os.getenv(
+        "VLLM_INT8KV_FA_CONTINUATION_WORKSPACE_BYTES",
+        str(24 * (1 << 20)),
+    )
 )
 _INT8KV_FA_DIRECT_PAGED = os.getenv("VLLM_INT8KV_FA_DIRECT_PAGED", "0") == "1"
 _INT8KV_ALIGNED_HEAD_STRIDE = (
@@ -82,9 +94,10 @@ _INT8KV_ALIGNED_HEAD_STRIDE = (
 )
 _INT8KV_FI_PREFILL_WORKSPACES: dict[tuple[str, str], torch.Tensor] = {}
 _INT8KV_FI_PREFILL_WRAPPERS: dict[tuple[object, ...], BatchPrefillWithRaggedKVCacheWrapper] = {}
+_INT8KV_FI_CONTINUATION_WRAPPERS: dict[tuple[object, ...], "_FlashInferPlanCache"] = {}
 _INT8KV_FI_PAGED_WRAPPERS: dict[tuple[object, ...], BatchPrefillWithRaggedKVCacheWrapper] = {}
 _INT8KV_FI_KV_WORKSPACES: dict[
-    tuple[str, str, int, int, int], tuple[torch.Tensor, torch.Tensor]
+    tuple[str, str, int, int], tuple[torch.Tensor, torch.Tensor]
 ] = {}
 _INT8KV_FA_PREFILL_USED = 0
 _INT8KV_FA_DIRECT_USED = 0
@@ -115,6 +128,20 @@ _GEMMA4_SM75_FI_PREFILL256_USED = 0
 _GEMMA4_FI_PREFILL_WRAPPERS: dict[
     tuple[object, ...], BatchPrefillWithRaggedKVCacheWrapper
 ] = {}
+
+
+@dataclass
+class _FlashInferPlanCache:
+    wrapper: BatchPrefillWithRaggedKVCacheWrapper
+    plan_key: tuple[object, ...] | None = None
+
+
+@dataclass
+class _Int8KVContinuationKVCache:
+    stable_seq_len: int = 0
+    block_ids: tuple[int, ...] | None = None
+    workspace_key: tuple[str, str, int, int, int] | None = None
+
 
 def _int8kv_direct_paged_jit_args(head_size: int) -> list[object]:
     variant_decl = r"""
@@ -257,10 +284,12 @@ def _get_int8kv_flashinfer_kv_workspace(
     min_tokens: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     device = _int8kv_normalize_cuda_device(device)
-    capacity = 1 << (int(min_tokens) - 1).bit_length()
-    key = (str(device), str(dtype), num_kv_heads, head_size, capacity)
-    workspaces = _INT8KV_FI_KV_WORKSPACES.get(key)
-    if workspaces is None:
+    cache_key = (str(device), str(dtype), num_kv_heads, head_size)
+    workspaces = _INT8KV_FI_KV_WORKSPACES.get(cache_key)
+    capacity = _int8kv_flashinfer_kv_workspace_capacity(
+        dtype, num_kv_heads, head_size, min_tokens
+    )
+    if workspaces is None or workspaces[0].shape[0] < min_tokens:
         k_workspace = torch.empty(
             (capacity, num_kv_heads, head_size),
             dtype=dtype,
@@ -268,8 +297,34 @@ def _get_int8kv_flashinfer_kv_workspace(
         )
         v_workspace = torch.empty_like(k_workspace)
         workspaces = (k_workspace, v_workspace)
-        _INT8KV_FI_KV_WORKSPACES[key] = workspaces
+        _INT8KV_FI_KV_WORKSPACES[cache_key] = workspaces
     return workspaces
+
+
+def _int8kv_flashinfer_kv_workspace_capacity(
+    dtype: torch.dtype,
+    num_kv_heads: int,
+    head_size: int,
+    min_tokens: int,
+) -> int:
+    capacity = max(1, int(min_tokens))
+    budget_bytes = _INT8KV_FA_CONTINUATION_WORKSPACE_BYTES
+    if budget_bytes > 0:
+        element_size = torch.empty((), dtype=dtype).element_size()
+        bytes_per_token = max(1, num_kv_heads * head_size * element_size * 2)
+        capacity = max(capacity, budget_bytes // bytes_per_token)
+    return capacity
+
+
+def _int8kv_flashinfer_kv_workspace_key(
+    device: torch.device,
+    dtype: torch.dtype,
+    num_kv_heads: int,
+    head_size: int,
+    capacity: int,
+) -> tuple[str, str, int, int, int]:
+    device = _int8kv_normalize_cuda_device(device)
+    return (str(device), str(dtype), num_kv_heads, head_size, int(capacity))
 
 
 # constants
@@ -640,6 +695,7 @@ class TritonAttentionImpl(AttentionImpl):
     # Per-token-head quant: scale views carved from inline head padding.
     _k_scale_cache: torch.Tensor | None = None
     _v_scale_cache: torch.Tensor | None = None
+    _int8kv_continuation_kv_cache: _Int8KVContinuationKVCache | None = None
 
     def _debug_verify_per_token_head_cache_update(
         self,
@@ -822,6 +878,18 @@ class TritonAttentionImpl(AttentionImpl):
         )
         self._v_scale_cache.fill_(1.0)
 
+    def _reset_int8kv_continuation_kv_cache(self) -> None:
+        if self._int8kv_continuation_kv_cache is None:
+            return
+        self._int8kv_continuation_kv_cache.stable_seq_len = 0
+        self._int8kv_continuation_kv_cache.block_ids = None
+        self._int8kv_continuation_kv_cache.workspace_key = None
+
+    def _get_int8kv_continuation_kv_cache(self) -> _Int8KVContinuationKVCache:
+        if self._int8kv_continuation_kv_cache is None:
+            self._int8kv_continuation_kv_cache = _Int8KVContinuationKVCache()
+        return self._int8kv_continuation_kv_cache
+
     def fused_output_quant_supported(self, quant_key: QuantKey):
         return quant_key == kFp8StaticTensorSym
 
@@ -876,6 +944,7 @@ class TritonAttentionImpl(AttentionImpl):
         self.use_alibi_sqrt = use_alibi_sqrt
         self.chunk_lookback = chunk_lookback
         self.supports_quant_query_input = current_platform.is_cuda()
+        self._int8kv_continuation_kv_cache = None
 
         self._kv_quant_mode = get_kv_quant_mode(kv_cache_dtype)
         self._is_per_token_head_quant = self._kv_quant_mode.is_per_token_head
@@ -938,6 +1007,33 @@ class TritonAttentionImpl(AttentionImpl):
             wrapper.plan(**plan_kwargs)
             _INT8KV_FI_PREFILL_WRAPPERS[cache_key] = wrapper
         return wrapper
+
+    def _get_or_replan_int8kv_flashinfer_continuation_wrapper(
+        self,
+        device: torch.device,
+        cache_key: tuple[object, ...],
+        plan_key: tuple[object, ...],
+        plan_kwargs: dict[str, object],
+    ) -> BatchPrefillWithRaggedKVCacheWrapper:
+        norm_device = _int8kv_normalize_cuda_device(device)
+        wrapper_key = (str(norm_device), _INT8KV_FI_PREFILL_BACKEND, *cache_key)
+        entry = _INT8KV_FI_CONTINUATION_WRAPPERS.get(wrapper_key)
+        if entry is None:
+            workspace = _get_int8kv_flashinfer_prefill_workspace(
+                norm_device, _INT8KV_FI_PREFILL_BACKEND
+            )
+            entry = _FlashInferPlanCache(
+                BatchPrefillWithRaggedKVCacheWrapper(
+                    workspace,
+                    "NHD",
+                    backend=_INT8KV_FI_PREFILL_BACKEND,
+                )
+            )
+            _INT8KV_FI_CONTINUATION_WRAPPERS[wrapper_key] = entry
+        if entry.plan_key != plan_key:
+            entry.wrapper.plan(**plan_kwargs)
+            entry.plan_key = plan_key
+        return entry.wrapper
 
     def _get_int8kv_flashinfer_paged_wrapper(
         self,
@@ -1090,30 +1186,24 @@ class TritonAttentionImpl(AttentionImpl):
                 logger.info("INT8 KV FlashInfer prefill skipped reason=%s err=%s", skip_reason, e)
             return False
 
-    def _dequantize_int8kv_cache_range(
+    def _dequantize_int8kv_cache_range_into(
         self,
         key_cache: torch.Tensor,
         value_cache: torch.Tensor,
         block_table: torch.Tensor,
         start: int,
         end: int,
-        dtype: torch.dtype,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+        out_k: torch.Tensor,
+        out_v: torch.Tensor,
+    ) -> None:
+        num_tokens = end - start
+        assert out_k.shape[0] == num_tokens
+        assert out_v.shape[0] == num_tokens
         block_size = key_cache.shape[1]
         start_block = start // block_size
         end_block = (end + block_size - 1) // block_size
         offset = start - start_block * block_size
-        num_tokens = end - start
         blocks = block_table[0, start_block:end_block].to(torch.long)
-        k_workspace, v_workspace = _get_int8kv_flashinfer_kv_workspace(
-            key_cache.device,
-            dtype,
-            self.num_kv_heads,
-            self.head_size,
-            num_tokens,
-        )
-        k_target = k_workspace[:num_tokens]
-        v_target = v_workspace[:num_tokens]
         k_data = key_cache[blocks, :, :, : self.head_size].reshape(
             -1, self.num_kv_heads, self.head_size
         )[offset : offset + num_tokens]
@@ -1126,9 +1216,70 @@ class TritonAttentionImpl(AttentionImpl):
         v_scale = self._v_scale_cache[blocks].reshape(
             -1, self.num_kv_heads
         )[offset : offset + num_tokens]
-        torch.mul(k_data.to(torch.float32), k_scale.unsqueeze(-1), out=k_target)
-        torch.mul(v_data.to(torch.float32), v_scale.unsqueeze(-1), out=v_target)
+        if (
+            _INT8KV_FA_CONTINUATION_FP16_DEQUANT
+            and out_k.dtype == torch.float16
+            and out_v.dtype == torch.float16
+        ):
+            out_k.copy_(k_data)
+            out_v.copy_(v_data)
+            out_k.mul_(k_scale.to(dtype=out_k.dtype).unsqueeze(-1))
+            out_v.mul_(v_scale.to(dtype=out_v.dtype).unsqueeze(-1))
+            return
+        torch.mul(k_data.to(torch.float32), k_scale.unsqueeze(-1), out=out_k)
+        torch.mul(v_data.to(torch.float32), v_scale.unsqueeze(-1), out=out_v)
+
+    def _dequantize_int8kv_cache_range(
+        self,
+        key_cache: torch.Tensor,
+        value_cache: torch.Tensor,
+        block_table: torch.Tensor,
+        start: int,
+        end: int,
+        dtype: torch.dtype,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        num_tokens = end - start
+        k_workspace, v_workspace = _get_int8kv_flashinfer_kv_workspace(
+            key_cache.device,
+            dtype,
+            self.num_kv_heads,
+            self.head_size,
+            num_tokens,
+        )
+        k_target = k_workspace[:num_tokens]
+        v_target = v_workspace[:num_tokens]
+        self._dequantize_int8kv_cache_range_into(
+            key_cache,
+            value_cache,
+            block_table,
+            start,
+            end,
+            k_target,
+            v_target,
+        )
         return k_target, v_target
+
+    def _int8kv_dequant_workspace_bytes(
+        self, num_tokens: int, dtype: torch.dtype
+    ) -> int:
+        element_size = torch.empty((), dtype=dtype).element_size()
+        return (
+            max(0, num_tokens)
+            * self.num_kv_heads
+            * self.head_size
+            * element_size
+            * 2
+        )
+
+    def _int8kv_cascade_tile_tokens(self, dtype: torch.dtype) -> int:
+        tile_tokens = max(1, _INT8KV_FA_CASCADE_TILE_TOKENS)
+        budget_bytes = _INT8KV_FA_CONTINUATION_WORKSPACE_BYTES
+        if budget_bytes <= 0:
+            return tile_tokens
+        bytes_per_token = self._int8kv_dequant_workspace_bytes(1, dtype)
+        if bytes_per_token <= 0:
+            return tile_tokens
+        return min(tile_tokens, max(1, budget_bytes // bytes_per_token))
 
     def _run_int8kv_cascade_flashinfer_prefill(
         self,
@@ -1140,7 +1291,7 @@ class TritonAttentionImpl(AttentionImpl):
         q_len: int,
     ) -> torch.Tensor:
         prefix_len = seq_len - q_len
-        tile_tokens = max(1, _INT8KV_FA_CASCADE_TILE_TOKENS)
+        tile_tokens = self._int8kv_cascade_tile_tokens(query.dtype)
         state_v = None
         state_s = None
 
@@ -1275,6 +1426,7 @@ class TritonAttentionImpl(AttentionImpl):
         use_continuation_bridge = False
         use_cascade_bridge = False
         force_first_chunk_dequant = False
+        stable_prefix_len = 0
         seq_len = int(attn_metadata.max_seq_len)
         if is_first_chunk and _INT8KV_FA_FIRST_CHUNK_DEQUANT:
             if q_seq_lens.numel() != 1:
@@ -1291,13 +1443,23 @@ class TritonAttentionImpl(AttentionImpl):
                 skip_reason = "prefix_or_cached_kv"
             elif q_seq_lens.numel() != 1:
                 skip_reason = "continuation_batch_not_1"
-            elif int(q_seq_lens[0].item()) < _INT8KV_FA_CONTINUATION_MIN_Q:
-                skip_reason = "continuation_q_too_small"
             elif attn_metadata.seq_lens_cpu is None:
                 skip_reason = "continuation_missing_seq_lens_cpu"
             else:
+                q_len = int(q_seq_lens[0].item())
                 seq_len = int(attn_metadata.seq_lens_cpu[0].item())
-                if seq_len > _INT8KV_FA_CONTINUATION_MAX_TOKENS:
+                stable_prefix_len = int(num_computed_tokens_cpu[0].item())
+                if q_len < _INT8KV_FA_CONTINUATION_MIN_Q:
+                    if not _INT8KV_FA_DIRECT_PAGED:
+                        skip_reason = "continuation_q_too_small"
+                elif (
+                    _INT8KV_FA_CASCADE_DEQUANT
+                    and _INT8KV_FA_CONTINUATION_WORKSPACE_BYTES > 0
+                    and self._int8kv_dequant_workspace_bytes(seq_len, query.dtype)
+                    > _INT8KV_FA_CONTINUATION_WORKSPACE_BYTES
+                ):
+                    use_cascade_bridge = True
+                elif seq_len > _INT8KV_FA_CONTINUATION_MAX_TOKENS:
                     if _INT8KV_FA_CASCADE_DEQUANT:
                         use_cascade_bridge = True
                     else:
@@ -1312,6 +1474,9 @@ class TritonAttentionImpl(AttentionImpl):
                 _INT8KV_FA_PREFILL_SKIP_LOGGED.add(skip_reason)
                 logger.info("INT8 KV FlashInfer prefill skipped reason=%s", skip_reason)
             return False
+
+        if is_first_chunk or not use_continuation_bridge or use_cascade_bridge:
+            self._reset_int8kv_continuation_kv_cache()
 
         q_prefill = query[:num_actual_tokens]
         if not q_prefill.is_contiguous():
@@ -1376,7 +1541,7 @@ class TritonAttentionImpl(AttentionImpl):
                     _INT8KV_FI_PREFILL_BACKEND,
                     num_actual_tokens,
                     seq_len,
-                    _INT8KV_FA_CASCADE_TILE_TOKENS,
+                    self._int8kv_cascade_tile_tokens(query.dtype),
                     attn_metadata.max_query_len,
                     query.shape[1],
                     key.shape[1],
@@ -1405,43 +1570,30 @@ class TritonAttentionImpl(AttentionImpl):
                 device=indptr_cpu.device,
             )
             max_sequence_kv = seq_len
-        plan_key = (
-            self.num_heads,
-            self.num_kv_heads,
-            self.head_size,
-            str(query.dtype),
-            str(key.dtype),
-            tuple(int(x) for x in indptr_cpu.tolist()),
-            tuple(int(x) for x in kv_indptr_cpu.tolist()),
-            attn_metadata.max_query_len,
-            max_sequence_kv,
+        qo_indptr = self._flashinfer_indptr(
+            indptr_cpu, self.num_heads, self.head_size
         )
-        wrapper = self._get_or_plan_int8kv_flashinfer_prefill_wrapper(
-            query.device,
-            plan_key,
-            {
-                "qo_indptr": self._flashinfer_indptr(
-                    indptr_cpu, self.num_heads, self.head_size
-                ),
-                "kv_indptr": self._flashinfer_indptr(
-                    kv_indptr_cpu, self.num_kv_heads, self.head_size
-                ),
-                "num_qo_heads": self.num_heads,
-                "num_kv_heads": self.num_kv_heads,
-                "head_dim_qk": self.head_size,
-                "causal": True,
-                "window_left": self.sliding_window[0],
-                "logits_soft_cap": self.logits_soft_cap,
-                "sm_scale": self.scale,
-                "pos_encoding_mode": "NONE",
-                "q_data_type": query.dtype,
-                "kv_data_type": key.dtype,
-                "seq_lens": kv_indptr_cpu[1:] - kv_indptr_cpu[:-1],
-                "seq_lens_q": q_seq_lens,
-                "max_token_per_sequence": attn_metadata.max_query_len,
-                "max_sequence_kv": max_sequence_kv,
-            },
+        kv_indptr = self._flashinfer_indptr(
+            kv_indptr_cpu, self.num_kv_heads, self.head_size
         )
+        plan_kwargs = {
+            "qo_indptr": qo_indptr,
+            "kv_indptr": kv_indptr,
+            "num_qo_heads": self.num_heads,
+            "num_kv_heads": self.num_kv_heads,
+            "head_dim_qk": self.head_size,
+            "causal": True,
+            "window_left": self.sliding_window[0],
+            "logits_soft_cap": self.logits_soft_cap,
+            "sm_scale": self.scale,
+            "pos_encoding_mode": "NONE",
+            "q_data_type": query.dtype,
+            "kv_data_type": key.dtype,
+            "seq_lens": kv_indptr_cpu[1:] - kv_indptr_cpu[:-1],
+            "seq_lens_q": q_seq_lens,
+            "max_token_per_sequence": attn_metadata.max_query_len,
+            "max_sequence_kv": max_sequence_kv,
+        }
         if use_continuation_bridge:
             self._ensure_scale_caches(kv_cache)
             key_cache, value_cache = kv_cache.unbind(1)
@@ -1455,24 +1607,70 @@ class TritonAttentionImpl(AttentionImpl):
                 self.head_size,
                 seq_len,
             )
+            workspace_key = _int8kv_flashinfer_kv_workspace_key(
+                query.device,
+                query.dtype,
+                self.num_kv_heads,
+                self.head_size,
+                k_workspace.shape[0],
+            )
             k_target = k_workspace[:seq_len]
             v_target = v_workspace[:seq_len]
-            k_data = key_cache[blocks, :, :, : self.head_size].reshape(
-                -1, self.num_kv_heads, self.head_size
-            )[:seq_len]
-            v_data = value_cache[blocks, :, :, : self.head_size].reshape(
-                -1, self.num_kv_heads, self.head_size
-            )[:seq_len]
-            k_scale = self._k_scale_cache[blocks].reshape(
-                -1, self.num_kv_heads
-            )[:seq_len]
-            v_scale = self._v_scale_cache[blocks].reshape(
-                -1, self.num_kv_heads
-            )[:seq_len]
-            torch.mul(k_data.to(torch.float32), k_scale.unsqueeze(-1), out=k_target)
-            torch.mul(v_data.to(torch.float32), v_scale.unsqueeze(-1), out=v_target)
+            delta_start = 0
+            if _INT8KV_FA_CONTINUATION_INCREMENTAL_REUSE:
+                cache = self._get_int8kv_continuation_kv_cache()
+                block_ids = tuple(int(x) for x in blocks.tolist())
+                stable_nblocks = (
+                    (stable_prefix_len + block_size - 1) // block_size
+                    if stable_prefix_len > 0
+                    else 0
+                )
+                if (
+                    cache.workspace_key == workspace_key
+                    and stable_nblocks > 0
+                    and cache.block_ids is not None
+                    and cache.stable_seq_len > 0
+                    and len(cache.block_ids) >= stable_nblocks
+                    and len(block_ids) >= stable_nblocks
+                    and block_ids[:stable_nblocks]
+                    == cache.block_ids[:stable_nblocks]
+                ):
+                    # Under speculative/MTP decode, only the already-computed
+                    # prefix is stable across iterations. The current draft
+                    # tail may be rolled back, so always re-dequantize it.
+                    delta_start = min(cache.stable_seq_len, stable_prefix_len)
+                cache.stable_seq_len = stable_prefix_len
+                cache.block_ids = block_ids
+                cache.workspace_key = workspace_key
+            if delta_start < seq_len:
+                self._dequantize_int8kv_cache_range_into(
+                    key_cache,
+                    value_cache,
+                    attn_metadata.block_table,
+                    delta_start,
+                    seq_len,
+                    k_target[delta_start:seq_len],
+                    v_target[delta_start:seq_len],
+                )
             k_prefill = k_target
             v_prefill = v_target
+            wrapper = self._get_or_replan_int8kv_flashinfer_continuation_wrapper(
+                query.device,
+                (
+                    self.num_heads,
+                    self.num_kv_heads,
+                    self.head_size,
+                    str(query.dtype),
+                    str(key.dtype),
+                ),
+                (
+                    tuple(int(x) for x in indptr_cpu.tolist()),
+                    tuple(int(x) for x in kv_indptr_cpu.tolist()),
+                    attn_metadata.max_query_len,
+                    max_sequence_kv,
+                ),
+                plan_kwargs,
+            )
         else:
             k_prefill = key[:num_actual_tokens]
             v_prefill = value[:num_actual_tokens]
@@ -1480,6 +1678,21 @@ class TritonAttentionImpl(AttentionImpl):
                 k_prefill = k_prefill.contiguous()
             if not v_prefill.is_contiguous():
                 v_prefill = v_prefill.contiguous()
+            wrapper = self._get_or_plan_int8kv_flashinfer_prefill_wrapper(
+                query.device,
+                (
+                    self.num_heads,
+                    self.num_kv_heads,
+                    self.head_size,
+                    str(query.dtype),
+                    str(key.dtype),
+                    tuple(int(x) for x in indptr_cpu.tolist()),
+                    tuple(int(x) for x in kv_indptr_cpu.tolist()),
+                    attn_metadata.max_query_len,
+                    max_sequence_kv,
+                ),
+                plan_kwargs,
+            )
         if not _INT8KV_FA_RAGGED_PREFILL:
             skip_reason = "ragged_prefill_disabled"
             if skip_reason not in _INT8KV_FA_PREFILL_SKIP_LOGGED:

@@ -109,3 +109,18 @@ about 19G.
 | `qwen27b/fast/int4/fp16kv-256K-mtp3-text-only.env` | fast | 256K | FP16 | 3 | text-only | 1 | 1734.98 / 87.00 |
 | `qwen27b/fast/int4/tqk8v4-256K-mtp3-text-only.env` | fast | 256K | TQK8V4 | 3 | text-only | 1 | 1744.67 / 100.81 |
 | `qwen27b/fast/int4/tqk8v4-two250K-mtp3-text-only.env` | fast | 250K per workspace | TQK8V4 | 3 | text-only | 2 | 1739.23 / 99.91 |
+
+## Recent INT8KV 4K Reference
+
+These short-lane numbers supplement the large-context entries above. They were
+revalidated on the current shipped `normal` INT8KV routes with the repository's
+`PP4096/TG128` synthetic single-request lane.
+
+| Profile | Benchmark lane | Throughput | Notes |
+|---|---|---:|---|
+| `qwen27b/normal/fp8/int8kv-252K-mtp3-text-only.env` | PP4096/TG128 | 1557.20 / 73.79 | Current shipped FP8 INT8KV `normal` reference. |
+| `qwen27b/normal/int4/int8kv-two250K-mtp3-text-only.env` | PP4096/TG128 | 1684.19 / 69.53 | Current shipped GPTQ-INT4 INT8KV `normal` reference. |
+| `qwen27b/normal/int4/int8kv-512K-yarn-mtp3-text-only.env` | PP4096/TG128 | 1679.50 / 41.83 | Current shipped GPTQ-INT4 INT8KV + YaRN `normal` reference. |
+
+These short-lane rows supplement the validated large-context entries in the
+main tables above; they do not replace the long-context capacity evidence.
