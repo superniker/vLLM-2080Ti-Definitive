@@ -11,6 +11,7 @@ import torch.nn as nn
 from huggingface_hub import hf_hub_download
 from transformers import AutoModelForCausalLM, AutoModelForImageTextToText
 
+from vllm import _custom_ops as ops
 from vllm.config import ModelConfig, VllmConfig
 from vllm.config.load import LoadConfig
 from vllm.logger import init_logger
@@ -116,9 +117,8 @@ class GGUFModelLoader(BaseModelLoader):
         # models, this returns config itself.
         text_config = config.get_text_config()
         model_type = config.model_type
-        is_multimodal = (
-            hasattr(config, "vision_config") and config.vision_config is not None
-        )
+        # Qwen3_5Config 总是创建 vision_config,需以 mmproj 文件为准
+        is_multimodal = detect_gguf_multimodal(model_config.model) is not None
         gguf_to_hf_name_map = {}
         sideload_params: list[re.Pattern] = []
         # hack: ggufs have a different name than transformers
@@ -207,7 +207,9 @@ class GGUFModelLoader(BaseModelLoader):
 
         if is_multimodal:
             mm_proj_arch = gguf.MODEL_ARCH.MMPROJ
-            vision_num_layers = config.vision_config.num_hidden_layers
+            vision_num_layers = getattr(
+                config.vision_config, "num_hidden_layers", None
+            ) or getattr(config.vision_config, "depth", None)
             vision_name_map = gguf.get_tensor_name_map(mm_proj_arch, vision_num_layers)
         else:
             vision_name_map = None
@@ -220,11 +222,59 @@ class GGUFModelLoader(BaseModelLoader):
             AutoModelForImageTextToText if is_multimodal else AutoModelForCausalLM
         )
         with torch.device("meta"):
-            dummy_model = auto_cls.from_config(
-                config, trust_remote_code=model_config.trust_remote_code
-            )
+            try:
+                dummy_model = auto_cls.from_config(
+                    config, trust_remote_code=model_config.trust_remote_code
+                )
+            except ValueError:
+                # Qwen3_5Config 未注册到 transformers AutoModel(GGUF qwen35 场景)。
+                # vLLM Qwen3_5 继承 Qwen3Next(混合注意力),用 Qwen3NextForCausalLM
+                # 对 text_config 生成同构参数名。
+                logger.info(
+                    "AutoModel 无法识别 %s,改用 Qwen3NextForCausalLM 生成参数名映射",
+                    type(config).__name__,
+                )
+                from transformers.models.qwen3_next.configuration_qwen3_next import (
+                    Qwen3NextConfig,
+                )
+                from transformers.models.qwen3_next.modeling_qwen3_next import (
+                    Qwen3NextForCausalLM,
+                )
+
+                tc = config.get_text_config()
+                q3n = Qwen3NextConfig(
+                    **{
+                        k: v
+                        for k, v in vars(tc).items()
+                        if not k.startswith("_") and k != "model_type"
+                    },
+                    # Qwen3.5-27B 是稠密模型:关掉 Qwen3Next 默认的 MoE 分支
+                    num_experts=1,
+                    num_experts_per_tok=1,
+                    mlp_only_layers=[],
+                    decoder_sparse_step=10**9,  # 全层 dense MLP
+                )
+                dummy_model = Qwen3NextForCausalLM(q3n)
 
         state_dict = dummy_model.state_dict()
+        # Qwen3.5 GGUF:ssm_alpha/ssm_beta 分开存储,vLLM 的 Qwen3_5 load_weights
+        # 按 in_proj_b/shard0 + in_proj_a/shard1 分片加载,把合并名拆开
+        if model_type == "qwen35":
+            renamed: dict = {}
+            for name, tensor in state_dict.items():
+                if name.endswith(".linear_attn.in_proj_ba.weight"):
+                    base = name[: -len("in_proj_ba.weight")]
+                    renamed[base + "in_proj_b.weight"] = tensor
+                    renamed[base + "in_proj_a.weight"] = tensor
+                elif name.endswith(".linear_attn.in_proj_qkvz.weight"):
+                    # vLLM 按 in_proj_qkv(shard 0,1,2)+ in_proj_z(shard 3)分片加载;
+                    # GGUF 的 attn_qkv→in_proj_qkv、attn_gate→in_proj_z
+                    base = name[: -len("in_proj_qkvz.weight")]
+                    renamed[base + "in_proj_qkv.weight"] = tensor
+                    renamed[base + "in_proj_z.weight"] = tensor
+                else:
+                    renamed[name] = tensor
+            state_dict = renamed
         if hf_checkpoint_map := getattr(
             dummy_model, "_checkpoint_conversion_mapping", None
         ):
@@ -307,6 +357,13 @@ class GGUFModelLoader(BaseModelLoader):
             if gguf_name is None:
                 return None
 
+            # suffix 为空(裸参数如 A_log/dt_bias)时不能加尾点,
+            # 否则映射键 'blk.N.ssm_a.' 与 GGUF tensor 名 'blk.N.ssm_a' 不匹配;
+            # 但以 bias 结尾的裸参数(如 dt_bias)对应的 GGUF tensor 名带 .bias
+            if not suffix:
+                if base_name.endswith("bias"):
+                    return gguf_name + ".bias"
+                return gguf_name
             return gguf_name + "." + suffix
 
         # Build mapping and track unmapped parameters
@@ -349,7 +406,7 @@ class GGUFModelLoader(BaseModelLoader):
         weight_type_map = {}
         for f in gguf_files:
             weight_type_map.update(get_gguf_weight_type_map(f, gguf_to_hf_name_map))
-        is_multimodal = hasattr(model_config.hf_config, "vision_config")
+        is_multimodal = detect_gguf_multimodal(model_name_or_path) is not None
         if is_multimodal:
             mmproj_file = detect_gguf_multimodal(model_name_or_path)
             assert mmproj_file is not None, (
@@ -380,7 +437,7 @@ class GGUFModelLoader(BaseModelLoader):
             Tuples of (parameter_name, tensor) for all model weights
         """
         hf_config = model_config.hf_config
-        is_multimodal = hasattr(hf_config, "vision_config")
+        is_multimodal = detect_gguf_multimodal(model_name_or_path) is not None
 
         if is_multimodal:
             # Load mm_proj (mm_encoder + projector) for multimodal weights
@@ -396,9 +453,57 @@ class GGUFModelLoader(BaseModelLoader):
                 gguf_files, gguf_to_hf_name_map
             )
         else:
-            yield from gguf_quant_weights_iterator(
+            base_iter = gguf_quant_weights_iterator(
                 model_name_or_path, gguf_to_hf_name_map
             )
+            yield from self._iter_lm_head_unquantized(base_iter)
+
+    def _iter_lm_head_unquantized(
+        self, base_iter: Generator[tuple[str, torch.Tensor], None, None]
+    ) -> Generator[tuple[str, torch.Tensor], None, None]:
+        """GGUF 的 lm_head(output.weight)常以量化类型存储(Q6_K 等),但
+        ParallelLMHead 不支持 qweight_type 参数:拦截 qweight_type/qweight,
+        反量化后以 lm_head.weight 产出。"""
+        qweight_type: int | None = None
+        embed_qwt_type: gguf.GGMLQuantizationType | None = None
+        for name, tensor in base_iter:
+            if name == "lm_head.qweight_type":
+                qweight_type = tensor.item()
+                continue
+            if name == "model.embed_tokens.qweight_type":
+                embed_qwt_type = tensor.item()
+                continue
+            if name == "lm_head.qweight":
+                assert qweight_type is not None
+                # ops.ggml_dequantize 仅 CUDA;CPU 上用 gguf.dequantize 反量化
+                # 内存纪律:dequant 是 float32(248320x5120 ≈ 5GB),转 fp16 后立即释放,
+                # 严禁缓存复用(曾致双表 10GB 驻留 + 双 worker → user cgroup OOM)
+                dequant = gguf.dequantize(
+                    tensor.numpy(), gguf.GGMLQuantizationType(qweight_type)
+                )
+                tensor = torch.from_numpy(dequant).to(torch.float16)
+                del dequant
+                name = "lm_head.weight"
+            elif name == "model.embed_tokens.qweight":
+                # llama.cpp 的 embed = token_embd.weight(Q4_K),lm_head = output.weight(Q6_K),
+                # 两表不相关(corr≈0)。此前误复用 output.weight 做 embed,导致整个链从输入就错。
+                # 现在正确反量化 token_embd.weight 作为 embed 表。
+                assert embed_qwt_type is not None
+                dequant = gguf.dequantize(
+                    tensor.numpy(), gguf.GGMLQuantizationType(embed_qwt_type)
+                )
+                tensor = torch.from_numpy(dequant).to(torch.float16)
+                del dequant
+                name = "model.embed_tokens.weight"
+            elif name.endswith(".linear_attn.conv1d.weight"):
+                # vLLM GDN conv1d 是 [conv_dim, 1, kernel](unsqueeze 过),
+                # GGUF 产出 [channels, kernel] 2D,补上中间维
+                tensor = tensor.unsqueeze(1)
+            elif name.endswith(".linear_attn.A_log"):
+                # GGUF 的 ssm_a 是 llama.cpp 预计算的 -exp(A_log)(小负值),
+                # vLLM forward 里再 -exp(A_log) 会双重 exp;转换回原始 log 值
+                tensor = torch.log(-tensor.float())
+            yield name, tensor
 
     def download_model(self, model_config: ModelConfig) -> None:
         self._prepare_weights(model_config)
@@ -433,6 +538,14 @@ class GGUFModelLoader(BaseModelLoader):
             for name, weight_type in weight_type_map.items()
             if weight_type in ("F32", "F16", "BF16") and name.endswith(".weight")
         ]
+        # lm_head/output 在 GGUF 里常以量化类型存储(Q6_K 等),但 ParallelLMHead
+        # 不支持 qweight_type 元数据,强制按未量化(反量化)加载
+        if "lm_head" not in unquant_names:
+            unquant_names.append("lm_head")
+        # embed_tokens 同理:Qwen3_5 的 GGUFEmbeddingMethod 对 qweight_type
+        # 处理有缺陷(参数未创建),强制反量化走普通 weight 加载
+        if "model.embed_tokens" not in unquant_names:
+            unquant_names.append("model.embed_tokens")
         logger.debug("GGUF unquantized modules: %s", unquant_names)
         if TYPE_CHECKING:
             vllm_config.quant_config = cast(GGUFConfig, vllm_config.quant_config)

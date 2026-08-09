@@ -29,8 +29,22 @@ from vllm.model_executor.layers.fused_moe import (
     fused_moe_make_expert_params_mapping,
 )
 from vllm.model_executor.layers.layernorm import (
-    GemmaRMSNorm as Qwen3NextRMSNorm,
+    GemmaRMSNorm,
+    RMSNorm,
 )
+
+# [FORK 兼容] GGUF 的 RMSNorm 权重已含 +1(llama.cpp 惯例,见 conversion/gemma.py norm_shift),
+# 必须用普通 RMSNorm 直接乘;safetensors 权重是原始 w(1+w 语义),用 GemmaRMSNorm。
+# 与上游 vLLM PR #31464/#37220 的 Gemma2/3 GGUF 修复一致。
+# 注意:不能用 vllm_config.quant_config 判断(GGUF 路径下它是 None),
+# 用 model_config.load_format;其他格式(safetensors/AWQ 等)默认走 GemmaRMSNorm 原版。
+def _get_qwen3_next_rms_norm_cls(load_format) -> type:
+    if load_format == "gguf":
+        return RMSNorm
+    return GemmaRMSNorm
+
+
+Qwen3NextRMSNorm = GemmaRMSNorm
 from vllm.model_executor.layers.linear import (
     QKVParallelLinear,
     ReplicatedLinear,
@@ -210,6 +224,7 @@ class Qwen3NextAttention(nn.Module):
         cache_config: CacheConfig | None = None,
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
+        load_format: str = "auto",  # [FORK 兼容] GGUF 时选普通 RMSNorm(权重含 +1)
     ) -> None:
         super().__init__()
         self.config = config
@@ -278,8 +293,12 @@ class Qwen3NextAttention(nn.Module):
             else {},
         )
 
-        self.q_norm = Qwen3NextRMSNorm(self.head_dim, eps=config.rms_norm_eps)
-        self.k_norm = Qwen3NextRMSNorm(self.head_dim, eps=config.rms_norm_eps)
+        self.q_norm = _get_qwen3_next_rms_norm_cls(load_format)(
+            self.head_dim, eps=config.rms_norm_eps
+        )
+        self.k_norm = _get_qwen3_next_rms_norm_cls(load_format)(
+            self.head_dim, eps=config.rms_norm_eps
+        )
 
     def forward(
         self,
@@ -332,6 +351,13 @@ class Qwen3NextDecoderLayer(nn.Module):
         model_config = vllm_config.model_config
         cache_config = vllm_config.cache_config
         quant_config = vllm_config.quant_config
+        # [FORK 兼容] GGUF 加载时所有 RMSNorm 权重含 +1,需普通 RMSNorm
+        # multiproc worker 反序列化后 load_config 可能丢失,兜底为 gguf
+        # (qwen35 目前只有 GGUF 加载路径)
+        try:
+            load_format = vllm_config.load_config.load_format
+        except Exception:
+            load_format = "gguf"
 
         self.layer_type = layer_type
         self.layer_idx = extract_layer_index(prefix)
@@ -350,6 +376,7 @@ class Qwen3NextDecoderLayer(nn.Module):
                 cache_config=cache_config,
                 quant_config=quant_config,
                 prefix=f"{prefix}.self_attn",
+                load_format=load_format,  # [FORK 兼容] GGUF 时 q/k_norm 用普通 RMSNorm
             )
         else:
             raise ValueError(f"Invalid layer_type {self.layer_type}")
@@ -374,10 +401,10 @@ class Qwen3NextDecoderLayer(nn.Module):
                 prefix=f"{prefix}.mlp",
             )
 
-        self.input_layernorm = Qwen3NextRMSNorm(
+        self.input_layernorm = _get_qwen3_next_rms_norm_cls(load_format)(
             config.hidden_size, eps=config.rms_norm_eps
         )
-        self.post_attention_layernorm = Qwen3NextRMSNorm(
+        self.post_attention_layernorm = _get_qwen3_next_rms_norm_cls(load_format)(
             config.hidden_size, eps=config.rms_norm_eps
         )
 

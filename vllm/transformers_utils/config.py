@@ -36,6 +36,7 @@ from vllm.utils.torch_utils import common_broadcastable_dtype
 from .config_parser_base import ConfigParserBase
 from .gguf_utils import (
     check_gguf_file,
+    detect_gguf_multimodal,
     is_gguf,
     is_remote_gguf,
     split_remote_gguf,
@@ -129,6 +130,8 @@ _CONFIG_REGISTRY: dict[str, type[PretrainedConfig]] = LazyConfigDict(
     qwen3_asr="Qwen3ASRConfig",
     qwen3_next="Qwen3NextConfig",
     qwen3_5="Qwen3_5Config",
+    # GGUF/llama.cpp 命名:架构 qwen35 对应 HF Qwen3_5Config
+    qwen35="Qwen3_5Config",
     qwen3_5_moe="Qwen3_5MoeConfig",
     laguna="LagunaConfig",
     lfm2_moe="Lfm2MoeConfig",
@@ -764,6 +767,31 @@ def get_config(
             raise RuntimeError(f"Can't get gguf config for {config.model_type}.")
         model_type = MODEL_FOR_CAUSAL_LM_MAPPING_NAMES[config.model_type]
         config.update({"architectures": [model_type]})
+        # Qwen3_5Config 恒有 vision_config → vLLM 误判为多模态模型
+        # (ForConditionalGeneration)。GGUF 主文件是纯文本(视觉在 mmproj)时,
+        # 置 None 走文本模型 Qwen3_5ForCausalLM。
+        if (
+            config.model_type == "qwen35"
+            and getattr(config, "vision_config", None) is not None
+            and not (detect_gguf_multimodal(str(model)) is not None)
+        ):
+            config.vision_config = None
+        # GGUF ssm 结构 → vLLM GDN 布局(Qwen3.5 系):
+        # ssm_alpha/beta 输出 48 维、ssm_out 6144 = 48*128、ssm_dt/a[48]
+        # → linear_num_value_heads 必须为 48(默认 32 会导致 shape 不匹配)
+        if config.model_type == "qwen35":
+            text_config = config.get_text_config()
+            text_config.linear_num_value_heads = 48
+            # GGUF rope.freq_base=1e7 → rope_parameters(否则 vLLM 用默认 10000,
+            # position 编码错误导致输出乱码);partial_rotary_factor=0.25
+            # (GGUF dimension_count=64 / head_dim=256,get_rope 默认 1.0 会覆盖)
+            rope_theta = getattr(config, "rope_theta", None)
+            if rope_theta is not None:
+                text_config.rope_parameters = {
+                    "rope_type": "default",
+                    "rope_theta": rope_theta,
+                    "partial_rotary_factor": 0.25,
+                }
 
     # Architecture mapping for models without explicit architectures field
     if not config.architectures:

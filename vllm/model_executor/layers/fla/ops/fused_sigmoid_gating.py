@@ -48,6 +48,8 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
     V: tl.constexpr,
     BK: tl.constexpr,
     BV: tl.constexpr,
+    V_START: tl.constexpr,  # 本 TP rank 的 v-head 全局起始(interleaved 布局 TP 切分用)
+    GGUF_LAYOUT: tl.constexpr,  # [FORK 兼容] True=GGUF/llama.cpp 布局(mod16);False=AWQ/官方 div3 布局
     stride_init_state_token: tl.constexpr,
     stride_final_state_token: tl.constexpr,
     stride_indices_seq: tl.constexpr,
@@ -63,7 +65,19 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
 ):
     i_k, i_v, i_nh = tl.program_id(0), tl.program_id(1), tl.program_id(2)
     i_n, i_hv = i_nh // HV, i_nh % HV
-    i_h = i_hv // (HV // H)
+    # llama.cpp fused GDN 内核: k-head = v-head % num_k_heads (fastmodulo(h_idx, neqk1))
+    # q/k 已 all-gather 为全量(gather 顺序=[rank0 数据, rank1 数据]):
+    #   rank0(TP0, 后半权重 q8-15) -> gather 0-7 是 q8-15
+    #   rank1(TP1, 前半权重 q0-7)  -> gather 8-15 是 q0-7
+    # 本 rank 的 v-head 全局起始 v_start(TP0=24, TP1=0), 全局 v = v_start + i_hv
+    # 需要 q/k 的 gather 位置 p 满足 (p + H//2) % H = (v_start + i_hv) % H
+    # => p = (v_start + i_hv + H//2) % H; 令 V_START = (v_start + H//2) % H
+    if GGUF_LAYOUT:
+        # [FORK 兼容] GGUF/llama.cpp mod16 布局(需 q/k 全量 gather)
+        i_h = (i_hv + V_START) % H
+    else:
+        # [FORK 兼容] AWQ/transformers 官方 div3 布局(TP 切分下 q/k 各半,直接用本 rank 的 k-head)
+        i_h = i_hv // (HV // H)
     if IS_VARLEN:
         bos, eos = (
             tl.load(cu_seqlens + i_n).to(tl.int64),
@@ -145,7 +159,11 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
             b_h *= tl.exp(b_g)
         else:
             b_h *= tl.exp(b_g[None, :])
-        # [BV]
+        # llama.cpp GDN (delta-net-base.cpp / gated_delta_net.cu):
+        #   kv = S @ k (衰减后 state 的读取 = g*kv_old)
+        #   delta = (v - kv) * beta
+        #   S' = g*S + delta ⊗ k
+        # 注: 原来这里 b_v 和 b_k 都乘了 beta(双 beta), 与 llama.cpp 不符, 已修正
         b_v -= tl.sum(b_h * b_k[None, :], 1)
         b_v *= b_beta
         # [BV, BK]
@@ -197,6 +215,8 @@ def fused_sigmoid_gating_delta_rule_update(
     use_qk_l2norm_in_kernel: bool = False,
     is_kda: bool = False,
     null_block_id: int = NULL_BLOCK_ID,
+    v_start: int = 0,
+    gguf_layout: bool = False,  # [FORK 兼容] True=GGUF mod16 布局;False=AWQ 官方 div3 布局
 ):
     """
     Fused triton implementation of sigmoid gating delta rule update.
@@ -266,6 +286,8 @@ def fused_sigmoid_gating_delta_rule_update(
         V=V,
         BK=BK,
         BV=BV,
+        V_START=v_start,
+        GGUF_LAYOUT=gguf_layout,
         stride_init_state_token=stride_init_state_token,
         stride_final_state_token=stride_final_state_token,
         stride_indices_seq=stride_indices_seq,
