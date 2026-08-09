@@ -186,7 +186,24 @@ class Qwen3_5Config(PretrainedConfig):
         if isinstance(text_config, dict):
             self.text_config = self.sub_configs["text_config"](**text_config)
         elif text_config is None:
-            self.text_config = self.sub_configs["text_config"]()
+            # GGUF 加载时字段是顶层 kwargs(hidden_size 等),转发给 text_config,
+            # 否则 Qwen3_5TextConfig 全部用默认值(hidden=4096 等)
+            _text_keys = (
+                "vocab_size", "hidden_size", "intermediate_size",
+                "num_hidden_layers", "num_attention_heads",
+                "num_key_value_heads", "hidden_act",
+                "max_position_embeddings", "initializer_range",
+                "rms_norm_eps", "use_cache", "tie_word_embeddings",
+                "rope_parameters", "attention_bias", "attention_dropout",
+                "head_dim", "linear_conv_kernel_dim", "linear_key_head_dim",
+                "linear_value_head_dim", "linear_num_key_heads",
+                "linear_num_value_heads", "layer_types",
+                "full_attention_interval", "pad_token_id", "bos_token_id",
+                "eos_token_id",
+            )
+            self.text_config = self.sub_configs["text_config"](
+                **{k: v for k, v in kwargs.items() if k in _text_keys}
+            )
 
         self.image_token_id = image_token_id
         self.video_token_id = video_token_id

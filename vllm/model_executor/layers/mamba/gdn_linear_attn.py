@@ -18,6 +18,7 @@ from vllm.distributed import (
     divide,
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
+    get_tp_group,  # [FORK 兼容] GGUF 布局 q/k all-gather 用
 )
 from vllm.forward_context import ForwardContext, get_forward_context
 from vllm.logger import init_logger
@@ -32,6 +33,11 @@ from vllm.model_executor.layers.fla.ops import (
 )
 from vllm.model_executor.layers.fla.ops.chunk import l2norm_fwd
 from vllm.model_executor.layers.fla.ops.utils import FLA_CHUNK_SIZE
+
+# [FORK 兼容] 双路线布局开关:
+#   VLLM_GDN_GGUF_LAYOUT=1 -> GGUF/llama.cpp mod16 布局(serve_gguf.sh 设置)
+#   未设置(默认)          -> AWQ/其他格式走 transform/div3 原版路径
+_GDN_GGUF_LAYOUT = os.getenv("VLLM_GDN_GGUF_LAYOUT", "0") == "1"
 from vllm.model_executor.layers.layernorm import RMSNormGated
 from vllm.model_executor.layers.linear import (
     ColumnParallelLinear,
@@ -443,6 +449,23 @@ class GatedDeltaNetAttention(PluggableLayer, MambaBase):
         super().__init__()
         self.tp_size = get_tensor_model_parallel_world_size()
         self.tp_rank = get_tensor_model_parallel_rank()
+        # [FORK 兼容] GGUF(mod16)布局下,本 rank 的 v-head 全局起始:
+        # rank0 拿后半(v24-47),rank1 拿前半(v0-23)(shard 逆序)
+        # 内核偏移 V_START = (v_start + H//2) % H:
+        #   TP0: (24+8)%16=0  -> i_h = i_hv % 16 (gather 0-7=自己的 q8-15)
+        #   TP1: (0+8)%16=8   -> i_h = (i_hv+8) % 16 (gather 8-15=TP1 的 q0-7)
+        # AWQ/其他格式(div3)不使用 V_START(内核走 div3 分支),恒为 0
+        v_start = (
+            (self.tp_size - 1 - self.tp_rank)
+            * (config.linear_num_value_heads // self.tp_size)
+            if self.tp_size > 1 and _GDN_GGUF_LAYOUT
+            else 0
+        )
+        self._gdn_v_start = (
+            (v_start + config.linear_num_key_heads // 2) % config.linear_num_key_heads
+            if self.tp_size > 1 and _GDN_GGUF_LAYOUT
+            else 0
+        )
         self.hidden_size = config.hidden_size
         self.num_v_heads = config.linear_num_value_heads
         self.num_k_heads = config.linear_num_key_heads
@@ -852,9 +875,21 @@ class GatedDeltaNetAttention(PluggableLayer, MambaBase):
         z_shape_og = z.shape
         core_attn_out_2d = core_attn_out.reshape(-1, core_attn_out.shape[-1])
         z_2d = z.reshape(-1, z.shape[-1])
+        # [FORK 兼容] RMSNormGated 要求两个输入同 dtype:
+        # GGUF(FP32)core/z 都是 FP32;AWQ(FP16)core 为内核输出 FP32,z 为 FP16,
+        # 这里把 z 对齐到 core 的 dtype
+        z_2d = z_2d.to(core_attn_out_2d.dtype)
         normed = self.norm(core_attn_out_2d, z_2d)
         normed_3d = normed.reshape(z_shape_og)
         proj_in = rearrange(normed_3d, "... h d -> ... (h d)")
+        _wp = getattr(self.out_proj, "qweight", None)
+        if _wp is not None:
+            # [FORK 兼容] 量化层(AWQ/GGUF):qweight 是 int32 打包,不能转成它的 dtype;
+            # AWQ 内核要求 FP16 输入;GGUF FP32 模式(VLLM_GGUF_FP32=1)保持 FP32
+            if os.getenv("VLLM_GGUF_FP32", "0") != "1":
+                proj_in = proj_in.to(torch.float16)
+        else:
+            proj_in = proj_in.to(self.out_proj.weight.dtype)
         output_chunk, _ = self.out_proj(proj_in)
         output[:num_tokens] = output_chunk
 
@@ -890,7 +925,7 @@ class GatedDeltaNetAttention(PluggableLayer, MambaBase):
             projected_states_ba = projected_states_ba.view(num_tokens, -1)
             core_attn_out = torch.empty(
                 (num_tokens, self.num_v_heads // self.tp_size, self.head_v_dim),
-                dtype=hidden_states.dtype,
+                dtype=torch.float32,  # [FORK 兼容] GGUF FP32 链:core 必须 FP32(AWQ 在 proj_in 分流回 FP16)
                 device=hidden_states.device,
             )
             z = torch.empty(
@@ -956,7 +991,7 @@ class GatedDeltaNetAttention(PluggableLayer, MambaBase):
         # see discussions in https://github.com/vllm-project/vllm/pull/28182
         core_attn_out = torch.zeros(
             (num_tokens, self.num_v_heads // self.tp_size, self.head_v_dim),
-            dtype=hidden_states.dtype,
+            dtype=torch.float32,  # [FORK 兼容] GGUF FP32 链:core 必须 FP32(AWQ 在 proj_in 分流回 FP16)
             device=hidden_states.device,
         )
 
@@ -1423,12 +1458,52 @@ class GatedDeltaNetAttention(PluggableLayer, MambaBase):
             value_non_spec = value_non_spec.unsqueeze(0)
             g_non_spec = g_non_spec.unsqueeze(0)
             beta_non_spec = beta_non_spec.unsqueeze(0)
+            if self.tp_size > 1 and _GDN_GGUF_LAYOUT:
+                # [FORK 兼容] 仅 GGUF(mod16)需要 q/k 全量(llama.cpp 映射 v-head%16
+                # 需要全部 16 个 k-head);AWQ(div3)TP 半切直用,不 gather
+                _tp_grp = get_tp_group()
+                query_non_spec = _tp_grp._all_gather_out_place(query_non_spec, 2)
+                key_non_spec = _tp_grp._all_gather_out_place(key_non_spec, 2)
         else:
-            query_non_spec, key_non_spec, value_non_spec = self.rearrange_mixed_qkv(
-                mixed_qkv_non_spec
-            )
-            g_non_spec = None
-            beta_non_spec = None
+            # [FORK 兼容] split_non_spec=False(纯 prefill)时,prefill 主调用
+            # 直接用全量 a/b(当前版未定义会 NameError,这里补兜底)
+            a_prefill = a
+            b_prefill = b
+            if _GDN_GGUF_LAYOUT:
+                # [FORK 兼容] GGUF(mod16)布局: fused_post_conv_prep 解包 + q/k 全量 gather
+                query_non_spec, key_non_spec, value_non_spec, g_non_spec, beta_non_spec = (
+                    fused_post_conv_prep(
+                        conv_output=mixed_qkv_non_spec,
+                        a=a,
+                        b=b,
+                        A_log=self.A_log,
+                        dt_bias=self.dt_bias,
+                        num_k_heads=self.num_k_heads // self.tp_size,
+                        head_k_dim=self.head_k_dim,
+                        head_v_dim=self.head_v_dim,
+                        apply_l2norm=True,
+                        output_g_exp=False,
+                    )
+                )
+                query_non_spec = query_non_spec.unsqueeze(0)
+                key_non_spec = key_non_spec.unsqueeze(0)
+                value_non_spec = value_non_spec.unsqueeze(0)
+                g_non_spec = g_non_spec.unsqueeze(0)
+                beta_non_spec = beta_non_spec.unsqueeze(0)
+                if self.tp_size > 1:
+                    # GGUF 映射 v-head%16 需要全部 16 个 k-head,TP 切分下各 rank 只有
+                    # 一半,all-gather 补齐(拼接顺序=[rank0, rank1])
+                    _tp_grp = get_tp_group()
+                    query_non_spec = _tp_grp._all_gather_out_place(query_non_spec, 2)
+                    key_non_spec = _tp_grp._all_gather_out_place(key_non_spec, 2)
+            else:
+                # [FORK 兼容] AWQ/其他格式(div3): 原版路径(rearrange_mixed_qkv,
+                # TP 切分下 q/k 各半,内核 div3 分支直接用本 rank 的 k-head,无需 gather)
+                query_non_spec, key_non_spec, value_non_spec = self.rearrange_mixed_qkv(
+                    mixed_qkv_non_spec
+                )
+                g_non_spec = None
+                beta_non_spec = None
 
         # 2. Recurrent attention
 
@@ -1452,6 +1527,8 @@ class GatedDeltaNetAttention(PluggableLayer, MambaBase):
                     ssm_state_indices=spec_state_indices_tensor,
                     num_accepted_tokens=num_accepted_tokens,
                     use_qk_l2norm_in_kernel=True,
+                    v_start=self._gdn_v_start,  # [FORK 兼容] 仅 GGUF 非 0
+                    gguf_layout=_GDN_GGUF_LAYOUT,  # [FORK 兼容] GGUF=mod16,其他=div3
                     null_block_id=PAD_SLOT_ID,
                 )
             )
@@ -1468,6 +1545,15 @@ class GatedDeltaNetAttention(PluggableLayer, MambaBase):
             query_decode, key_decode, value_decode = self.rearrange_mixed_qkv(
                 mixed_qkv_non_spec[:num_decode_tokens]
             )
+            if self.tp_size > 1 and _GDN_GGUF_LAYOUT:
+                # [FORK 兼容] 仅 GGUF(mod16)布局需要 q/k 全量 gather(AWQ div3 直接用本 rank 半切)
+                _tp_grp = get_tp_group()
+                query_decode = _tp_grp._all_gather_out_place(
+                    query_decode.unsqueeze(0), 2
+                ).squeeze(0)
+                key_decode = _tp_grp._all_gather_out_place(
+                    key_decode.unsqueeze(0), 2
+                ).squeeze(0)
             core_attn_out_decode, _ = fused_sigmoid_gating_delta_rule_update(
                 A_log=self.A_log,
                 a=a_non_spec[:num_decode_tokens],
@@ -1483,6 +1569,8 @@ class GatedDeltaNetAttention(PluggableLayer, MambaBase):
                 ],
                 ssm_state_indices=decode_state_indices,
                 use_qk_l2norm_in_kernel=True,
+                v_start=self._gdn_v_start,  # [FORK 兼容] 仅 GGUF 非 0
+                gguf_layout=_GDN_GGUF_LAYOUT,  # [FORK 兼容] GGUF=mod16,其他=div3
                 null_block_id=PAD_SLOT_ID,
             )
         else:
@@ -1498,23 +1586,48 @@ class GatedDeltaNetAttention(PluggableLayer, MambaBase):
             assert prefill_query_start_loc is not None
             initial_state = ssm_state[prefill_state_indices].contiguous()
             initial_state[~prefill_has_initial_state, ...] = 0
-            (
-                core_attn_out_non_spec,
-                last_recurrent_state,
-            ) = self.chunk_gated_delta_rule(
-                q=query_non_spec,
-                k=key_non_spec,
-                v=value_non_spec,
-                g=g_non_spec,
-                beta=beta_non_spec,
-                initial_state=initial_state,
-                output_final_state=True,
-                cu_seqlens=prefill_query_start_loc,
-                chunk_indices=attn_metadata.chunk_indices,
-                chunk_offsets=attn_metadata.chunk_offsets,
-                use_qk_l2norm_in_kernel=False,
-            )
-            # Init cache
+            if _GDN_GGUF_LAYOUT:
+                # [FORK 兼容] GGUF: 直接内核(mod16 + v_start),输出逐 token state 须切分
+                (
+                    core_attn_out_non_spec,
+                    last_recurrent_state,
+                ) = fused_sigmoid_gating_delta_rule_update(
+                    A_log=self.A_log,
+                    a=a_prefill,
+                    b=b_prefill,
+                    dt_bias=self.dt_bias,
+                    q=query_non_spec,
+                    k=key_non_spec,
+                    v=value_non_spec,
+                    initial_state=initial_state.clone(),
+                    inplace_final_state=False,
+                    cu_seqlens=prefill_query_start_loc,
+                    use_qk_l2norm_in_kernel=True,
+                    v_start=self._gdn_v_start,
+                    gguf_layout=True,
+                )
+                # 参考输出每 token 的 state,取每个序列最后 token 的 state
+                last_recurrent_state = last_recurrent_state[
+                    prefill_query_start_loc[1:] - 1
+                ]
+            else:
+                # [FORK 兼容] AWQ/其他格式: 原始 fork chunk 式路径(div3,fi/fla chunk)
+                (
+                    core_attn_out_non_spec,
+                    last_recurrent_state,
+                ) = self.chunk_gated_delta_rule(
+                    q=query_non_spec,
+                    k=key_non_spec,
+                    v=value_non_spec,
+                    g=g_non_spec,
+                    beta=beta_non_spec,
+                    initial_state=initial_state,
+                    output_final_state=True,
+                    cu_seqlens=prefill_query_start_loc,
+                    chunk_indices=attn_metadata.chunk_indices,
+                    chunk_offsets=attn_metadata.chunk_offsets,
+                    use_qk_l2norm_in_kernel=False,
+                )
             ssm_state[prefill_state_indices] = last_recurrent_state.to(ssm_state.dtype)
             global _GDN_DEBUG_PREFILL_USED
             if (

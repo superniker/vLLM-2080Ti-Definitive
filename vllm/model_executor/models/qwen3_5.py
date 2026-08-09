@@ -38,7 +38,15 @@ from vllm.distributed import (
 from vllm.logger import init_logger
 from vllm.model_executor.layers.layernorm import (
     GemmaRMSNorm as Qwen3_5RMSNorm,
+    RMSNorm,
 )
+
+# [FORK 兼容] GGUF 的 RMSNorm 权重含 +1(llama.cpp 惯例),用普通 RMSNorm;
+# safetensors/AWQ 等用 GemmaRMSNorm 原版(1+w 语义)。
+def _get_qwen3_5_rms_norm_cls(load_format) -> type:
+    if load_format == "gguf":
+        return RMSNorm
+    return Qwen3_5RMSNorm
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.mamba.gdn_linear_attn import GatedDeltaNetAttention
 from vllm.model_executor.layers.mamba.mamba_utils import (
@@ -133,6 +141,12 @@ class Qwen3_5DecoderLayer(Qwen3NextDecoderLayer):
             if override_quant_config is None
             else override_quant_config
         )
+        # [FORK 兼容] GGUF 时 RMSNorm 权重含 +1,用普通 RMSNorm;
+        # multiproc worker 反序列化后 load_config 可能丢失,兜底为 gguf
+        try:
+            _lf = vllm_config.load_config.load_format
+        except Exception:
+            _lf = "gguf"
 
         self.layer_type = layer_type
         self.layer_idx = extract_layer_index(prefix)
@@ -173,10 +187,10 @@ class Qwen3_5DecoderLayer(Qwen3NextDecoderLayer):
         else:
             raise ValueError(f"Invalid model_type {config.model_type}")
 
-        self.input_layernorm = Qwen3_5RMSNorm(
+        self.input_layernorm = _get_qwen3_5_rms_norm_cls(_lf)(
             config.hidden_size, eps=config.rms_norm_eps
         )
-        self.post_attention_layernorm = Qwen3_5RMSNorm(
+        self.post_attention_layernorm = _get_qwen3_5_rms_norm_cls(_lf)(
             config.hidden_size, eps=config.rms_norm_eps
         )
 
@@ -244,7 +258,14 @@ class Qwen3_5Model(Qwen3NextModel):
         )
 
         if get_pp_group().is_last_rank:
-            self.norm = Qwen3_5RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+            # [FORK 兼容] GGUF 时用普通 RMSNorm(权重含 +1);worker 反序列化兜底 gguf
+            try:
+                _lf = vllm_config.load_config.load_format
+            except Exception:
+                _lf = "gguf"
+            self.norm = _get_qwen3_5_rms_norm_cls(_lf)(
+                config.hidden_size, eps=config.rms_norm_eps
+            )
         else:
             self.norm = PPMissingLayer()
 
@@ -526,6 +547,11 @@ class Qwen3_5ForCausalLMBase(
             skip_prefixes=["mtp."],
         )
         return loader.load_weights(weights)
+
+    @classmethod
+    def get_mamba_state_copy_func(cls) -> tuple[MambaStateCopyFunc, MambaStateCopyFunc]:
+        # [FORK 兼容] GGUF 纯文本(ForCausalLM)也需 SSM 状态拷贝函数(原版只在多模态类里)
+        return MambaStateCopyFuncCalculator.gated_delta_net_state_copy_func()
 
 
 class Qwen3_5ForCausalLM(Qwen3_5ForCausalLMBase):
