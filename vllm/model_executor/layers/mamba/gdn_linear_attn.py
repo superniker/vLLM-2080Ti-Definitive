@@ -893,6 +893,7 @@ class GatedDeltaNetAttention(PluggableLayer, MambaBase):
         output_chunk, _ = self.out_proj(proj_in)
         output[:num_tokens] = output_chunk
 
+
         if (
             _GDN_DEBUG_OUTPUT
             and _GDN_DEBUG_OUTPUT_USED < 16
@@ -964,6 +965,7 @@ class GatedDeltaNetAttention(PluggableLayer, MambaBase):
         # ============================================================
         mixed_qkvz, _ = self.in_proj_qkvz(hidden_states)
         ba, _ = self.in_proj_ba(hidden_states)
+
 
         if self.gqa_interleaved_layout:
             # Qwen3-Next: unpack the interleaved GQA layout
@@ -1458,6 +1460,7 @@ class GatedDeltaNetAttention(PluggableLayer, MambaBase):
             value_non_spec = value_non_spec.unsqueeze(0)
             g_non_spec = g_non_spec.unsqueeze(0)
             beta_non_spec = beta_non_spec.unsqueeze(0)
+
             if self.tp_size > 1 and _GDN_GGUF_LAYOUT:
                 # [FORK 兼容] 仅 GGUF(mod16)需要 q/k 全量(llama.cpp 映射 v-head%16
                 # 需要全部 16 个 k-head);AWQ(div3)TP 半切直用,不 gather
@@ -1877,6 +1880,7 @@ class GatedDeltaNetAttention(PluggableLayer, MambaBase):
             out=out_buf,
             ssm_state_indices=non_spec_state_indices_tensor[:num_actual_tokens],  # type: ignore[index]
             use_qk_l2norm_in_kernel=True,
+            gguf_layout=_GDN_GGUF_LAYOUT,  # [FORK 兼容 2026-08-10 GPTQ8] div3 用 // 映射修复
             null_block_id=PAD_SLOT_ID,
         )
         if (

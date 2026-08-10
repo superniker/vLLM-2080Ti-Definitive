@@ -281,11 +281,20 @@ def fused_recurrent_gated_delta_rule_packed_decode_kernel(
     BV: tl.constexpr,
     SOFTPLUS_THRESHOLD: tl.constexpr,
     USE_QK_L2NORM_IN_KERNEL: tl.constexpr,
+    GGUF_LAYOUT: tl.constexpr,  # [FORK 兼容] True=GGUF mod16;False=AWQ/官方 div3
 ):
     i_v, i_nh = tl.program_id(0), tl.program_id(1)
     i_n, i_hv = i_nh // HV, i_nh % HV
-    # llama.cpp fused GDN: k-head = v-head % num_k_heads
-    i_h = i_hv % H
+    # [FORK 兼容 2026-08-10 GPTQ8] v-head → k-head 映射必须与布局一致:
+    #   GGUF/mod16(llama.cpp):k-head = v-head % num_k_heads(交错)
+    #   AWQ/transformers 官方 div3:repeat_interleave 语义 = v-head // (HV // H)(连续分组)
+    # 原实现写死 % H,导致 div3 布局 decode 阶段映射错乱(12*8=1 根因)。
+    if GGUF_LAYOUT:
+        # llama.cpp fused GDN: k-head = v-head % num_k_heads
+        i_h = i_hv % H
+    else:
+        # transformers 官方 div3: q/k repeat_interleave(ratio) → 连续分组
+        i_h = i_hv // (HV // H)
 
     o_k = tl.arange(0, BK)
     o_v = i_v * BV + tl.arange(0, BV)
@@ -351,6 +360,7 @@ def fused_recurrent_gated_delta_rule_packed_decode(
     ssm_state_indices: torch.Tensor,
     use_qk_l2norm_in_kernel: bool = False,
     null_block_id: int = NULL_BLOCK_ID,
+    gguf_layout: bool = False,  # [FORK 兼容] True=GGUF mod16;False=AWQ/官方 div3
 ) -> tuple[torch.Tensor, torch.Tensor]:
     if mixed_qkv.ndim != 2:
         raise ValueError(
@@ -477,6 +487,7 @@ def fused_recurrent_gated_delta_rule_packed_decode(
         BV=BV,
         SOFTPLUS_THRESHOLD=20.0,
         USE_QK_L2NORM_IN_KERNEL=use_qk_l2norm_in_kernel,
+        GGUF_LAYOUT=gguf_layout,  # [FORK 兼容] 布局分支
         num_warps=num_warps,
         num_stages=num_stages,
     )
