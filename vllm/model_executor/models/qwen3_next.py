@@ -308,6 +308,7 @@ class Qwen3NextAttention(nn.Module):
     ):
         qkv, _ = self.qkv_proj(hidden_states)
 
+
         if self.attn_output_gate:
             q_gate, k, v = qkv.split(
                 [self.q_size * 2, self.kv_size, self.kv_size], dim=-1
@@ -466,6 +467,8 @@ class Qwen3NextDecoderLayer(nn.Module):
 
         # Fully Connected
         hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
+
+
         hidden_states = self.mlp(hidden_states)
 
         if self.layer_scale:
@@ -481,6 +484,7 @@ class Qwen3NextDecoderLayer(nn.Module):
                 hidden_states = hidden_states * (
                     self.ffn_layer_scale.to(hidden_states.dtype) + 1
                 )
+
 
         return hidden_states, residual
 

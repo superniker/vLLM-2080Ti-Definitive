@@ -228,8 +228,8 @@ class GGUFModelLoader(BaseModelLoader):
                 )
             except ValueError:
                 # Qwen3_5Config 未注册到 transformers AutoModel(GGUF qwen35 场景)。
-                # vLLM Qwen3_5 继承 Qwen3Next(混合注意力),用 Qwen3NextForCausalLM
-                # 对 text_config 生成同构参数名。
+                # 用 Qwen3NextForCausalLM 生成文本参数名映射;视觉塔参数名
+                # 由下方手动补(model.visual.*,333 个,与 AWQ 权重一致)
                 logger.info(
                     "AutoModel 无法识别 %s,改用 Qwen3NextForCausalLM 生成参数名映射",
                     type(config).__name__,
@@ -257,6 +257,52 @@ class GGUFModelLoader(BaseModelLoader):
                 dummy_model = Qwen3NextForCausalLM(q3n)
 
         state_dict = dummy_model.state_dict()
+        # [FORK 兼容] Qwen3.5 GGUF 多模态:文本参数名对齐多模态模型
+        # (model.language_model.layers.N.xxx,与 AWQ 权重命名一致);
+        # 326-338 行的前缀处理会把它转成 gguf-py 认识的 model.layers.N.xxx,
+        # 而映射表值(load_weights 收到的名)能匹配 Qwen3_5ForConditionalGeneration
+        if is_multimodal:
+            state_dict = {
+                (
+                    name.replace("model.", "model.language_model.", 1)
+                    if name.startswith("model.")
+                    else name
+                ): tensor
+                for name, tensor in state_dict.items()
+            }
+        # [FORK 兼容] Qwen3.5 GGUF 多模态:补视觉塔参数名(dummy 是纯文本类,
+        # 无视觉参数;mmproj 权重映射需要 model.visual.* 键)。
+        # 结构取自 vLLM Qwen3_VisionTransformer(Qwen3.5 视觉塔,与 AWQ 权重一致):
+        # blocks(27 层):attn.qkv/attn.proj/mlp.linear_fc1/fc2/norm1/norm2;
+        # merger:linear_fc1/fc2/norm;patch_embed.proj;pos_embed
+        if is_multimodal:
+            _depth = getattr(config.vision_config, "depth", 27)
+            _vnames = [
+                "model.visual.patch_embed.proj.weight",
+                "model.visual.patch_embed.proj.bias",
+                "model.visual.pos_embed.weight",
+            ]
+            for _i in range(_depth):
+                _b = f"model.visual.blocks.{_i}"
+                _vnames += [
+                    f"{_b}.attn.qkv.weight", f"{_b}.attn.qkv.bias",
+                    f"{_b}.attn.proj.weight", f"{_b}.attn.proj.bias",
+                    f"{_b}.mlp.linear_fc1.weight", f"{_b}.mlp.linear_fc1.bias",
+                    f"{_b}.mlp.linear_fc2.weight", f"{_b}.mlp.linear_fc2.bias",
+                    f"{_b}.norm1.weight", f"{_b}.norm1.bias",
+                    f"{_b}.norm2.weight", f"{_b}.norm2.bias",
+                ]
+            _vnames += [
+                "model.visual.merger.linear_fc1.weight",
+                "model.visual.merger.linear_fc1.bias",
+                "model.visual.merger.linear_fc2.weight",
+                "model.visual.merger.linear_fc2.bias",
+                "model.visual.merger.norm.weight",
+                "model.visual.merger.norm.bias",
+            ]
+            for _vn in _vnames:
+                if _vn not in state_dict:
+                    state_dict[_vn] = torch.empty(0)
         # Qwen3.5 GGUF:ssm_alpha/ssm_beta 分开存储,vLLM 的 Qwen3_5 load_weights
         # 按 in_proj_b/shard0 + in_proj_a/shard1 分片加载,把合并名拆开
         if model_type == "qwen35":
@@ -320,7 +366,10 @@ class GGUFModelLoader(BaseModelLoader):
             # state_dict keys like 'model.language_model.layers.0...' and
             # 'model.vision_tower.vision_model...'.  Strip this outer
             # prefix so the keys match what gguf-py expects.
-            if is_multimodal and hf_name.startswith("model."):
+            if is_multimodal and (
+                hf_name.startswith("model.language_model.")
+                or hf_name.startswith("model.vision_tower.")
+            ):
                 hf_name = hf_name[6:]  # Remove outer 'model.'
 
             # Strip 'language_model.' prefix for multimodal models - gguf-py
@@ -348,11 +397,46 @@ class GGUFModelLoader(BaseModelLoader):
             gguf_name = None
             # Priority 1: Search vision/projector parameters for multimodal models
             if vision_name_map is not None:
-                gguf_name = vision_name_map.get_name(base_name)
+                # [FORK 兼容] Qwen3.5 GGUF 多模态:gguf-py 视觉键用
+                # vision_tower.* 风格,vLLM/AWQ 用 model.visual.*,转换后再查
+                vision_base = base_name
+                if vision_base.startswith("model.visual."):
+                    vision_base = (
+                        "vision_tower." + vision_base[len("model.visual."):]
+                    )
+                elif vision_base.startswith("visual."):
+                    vision_base = (
+                        "vision_tower." + vision_base[len("visual."):]
+                    )
+                gguf_name = vision_name_map.get_name(vision_base)
 
             # Priority 2: Search text backbone parameters
             if gguf_name is None:
                 gguf_name = text_name_map.get_name(base_name)
+
+            if gguf_name is None:
+                # [FORK 兼容] Qwen3.5 GGUF 多模态:gguf-py MMPROJ 映射缺失项,
+                # 手动补(视觉 mlp 的 ffn_up/down、pos_embed、merger)
+                if vision_name_map is not None:
+                    _vparts = vision_base.split(".")
+                    if (
+                        len(_vparts) == 5
+                        and _vparts[0] == "vision_tower"
+                        and _vparts[1] == "blocks"
+                        and _vparts[3] == "mlp"
+                    ):
+                        # vision_tower.blocks.N.mlp.linear_fcX → v.blk.N.ffn_up/down
+                        _fc = _vparts[4]
+                        _gguf_mlp = "ffn_up" if _fc == "linear_fc1" else "ffn_down"
+                        gguf_name = f"v.blk.{_vparts[2]}.{_gguf_mlp}"
+                    elif vision_base == "vision_tower.pos_embed":
+                        gguf_name = "v.position_embd"
+                    elif vision_base == "vision_tower.merger.linear_fc1":
+                        gguf_name = "mm.0"
+                    elif vision_base == "vision_tower.merger.linear_fc2":
+                        gguf_name = "mm.2"
+                    elif vision_base == "vision_tower.merger.norm":
+                        gguf_name = "v.post_ln"
 
             if gguf_name is None:
                 return None
@@ -445,7 +529,17 @@ class GGUFModelLoader(BaseModelLoader):
             assert mmproj_file is not None, (
                 "Could not find mm_proj file for multimodal GGUF model"
             )
-            yield from gguf_quant_weights_iterator(mmproj_file, gguf_to_hf_name_map)
+            # 注意:mmproj 的 F16 权重 GGUFReader.data 已是 [out, in]
+            # (vLLM 线性层布局),tensor.shape 元数据才是 [in, out],勿转置
+            for _name, _tensor in gguf_quant_weights_iterator(
+                mmproj_file, gguf_to_hf_name_map
+            ):
+                if _name.endswith(".patch_embed.proj.weight"):
+                    # GGUF conv 4D(1152,3,16,16)单帧共享权重;vLLM Conv3d
+                    # 是 5D(1152,3,2,16,16)(temporal_patch_size=2,与 AWQ 一致),
+                    # 2 帧共享权重:补时间维后复制 → (1152,3,2,16,16)
+                    _tensor = _tensor.unsqueeze(2).repeat(1, 1, 2, 1, 1)
+                yield _name, _tensor
 
         gguf_files = self._get_all_gguf_files(model_name_or_path)
         if len(gguf_files) > 1:

@@ -451,6 +451,8 @@ class Qwen3_5Model(Qwen3NextModel):
                     )
                     weight_loader(param, loaded_weight)
             loaded_params.add(name)
+
+
         return loaded_params
 
 
@@ -553,8 +555,46 @@ class Qwen3_5ForCausalLMBase(
         # [FORK 兼容] GGUF 纯文本(ForCausalLM)也需 SSM 状态拷贝函数(原版只在多模态类里)
         return MambaStateCopyFuncCalculator.gated_delta_net_state_copy_func()
 
+    @classmethod
+    def get_mamba_state_dtype_from_config(
+        cls,
+        vllm_config: "VllmConfig",
+    ) -> tuple[torch.dtype, torch.dtype]:
+        return MambaStateDtypeCalculator.gated_delta_net_state_dtype(
+            vllm_config.model_config.dtype,
+            vllm_config.cache_config.mamba_cache_dtype,
+            vllm_config.cache_config.mamba_ssm_cache_dtype,
+        )
 
-class Qwen3_5ForCausalLM(Qwen3_5ForCausalLMBase):
+    @classmethod
+    def get_mamba_state_shape_from_config(
+        cls, vllm_config: "VllmConfig"
+    ) -> tuple[tuple[int, int], tuple[int, int, int]]:
+        # [FORK 兼容] 纯文本 ForCausalLM 需自行实现(原版只在多模态类里),
+        # 供 IsHybrid 推导 mamba_block_size(GDN linear_attn 状态缓存)
+        parallel_config = vllm_config.parallel_config
+        hf_config = vllm_config.model_config.hf_text_config
+        tp_size = parallel_config.tensor_parallel_size
+        num_spec = (
+            vllm_config.speculative_config.num_speculative_tokens
+            if vllm_config.speculative_config
+            else 0
+        )
+        return MambaStateShapeCalculator.gated_delta_net_state_shape(
+            tp_size,
+            hf_config.linear_num_key_heads,
+            hf_config.linear_num_value_heads,
+            hf_config.linear_key_head_dim,
+            hf_config.linear_value_head_dim,
+            hf_config.linear_conv_kernel_dim,
+            num_spec,
+        )
+
+
+class Qwen3_5ForCausalLM(Qwen3_5ForCausalLMBase, IsHybrid):
+    # [FORK 兼容] GGUF 纯文本(Qwen3_5ForCausalLM)也含 linear_attn 混合层,
+    # 必须标记 IsHybrid 才能推导 mamba_block_size(GDN linear_attn 状态缓存),
+    # 否则 get_kv_cache_spec 断言 mamba_block_size is not None 崩溃。
     pass
 
 
