@@ -242,7 +242,32 @@ def extract_vision_config_from_gguf(mmproj_path: str) -> "SiglipVisionConfig | N
     # Create config with extracted parameters
     # Note: num_channels and attention_dropout use SiglipVisionConfig defaults
     # (3 and 0.0 respectively) which are correct for all models
-    config = SiglipVisionConfig(**config_params)
+    if projector_type == VisionProjectorType.GEMMA3:
+        config = SiglipVisionConfig(**config_params)
+    else:
+        # [FORK 兼容] Qwen3.5-VL(mmproj qwen3vl_merger):vision config 需
+        # Qwen3-VL 风格字段(depth/num_heads/spatial_merge_size),
+        # SiglipVisionConfig 缺这些字段(qwen3_vl.py get_data_parser 会崩)
+        from vllm.transformers_utils.configs.qwen3_5 import Qwen3_5VisionConfig
+
+        # out_hidden_size = clip.vision.projection_dim(mmproj 元数据,
+        # Qwen3.5-VL 27B = 5120;默认 3584 是错的,merger 权重加载会 shape 崩)
+        _proj_field = reader.get_field("clip.vision.projection_dim")
+        _out_hs = (
+            int(_proj_field.parts[-1]) if _proj_field else 3584
+        )
+        config = Qwen3_5VisionConfig(
+            depth=config_params["num_hidden_layers"],
+            hidden_size=config_params["hidden_size"],
+            intermediate_size=config_params["intermediate_size"],
+            num_heads=config_params["num_attention_heads"],
+            patch_size=config_params["patch_size"],
+            out_hidden_size=_out_hs,
+            # GGUF mmproj 的 conv 是 2D 单帧(16x16);vLLM 预处理把图像/视频
+            # 按 temporal_patch_size=2 组织(3 通道 × 时间维 2,与 AWQ 一致),
+            # 权重加载时复制时间维(见 gguf_loader patch_embed 处理)
+            temporal_patch_size=2,
+        )
 
     if projector_type:
         logger.info(
@@ -291,6 +316,14 @@ def maybe_patch_hf_config_from_gguf(
                 architectures=["Gemma3ForConditionalGeneration"],
             )
             hf_config = new_hf_config
+        elif vision_config is not None and hf_config.model_type in (
+            "qwen3_5", "qwen3_next", "qwen35"
+        ):
+            # [FORK 兼容] Qwen3.5 GGUF 多模态:Qwen3_5Config 的 vision_config
+            # 是空模板(字段 None),用 mmproj 提取的真实配置替换;
+            # 架构改为 ForConditionalGeneration(多模态类,与 AWQ 一致)
+            hf_config.vision_config = vision_config
+            hf_config.architectures = ["Qwen3_5ForConditionalGeneration"]
 
     return hf_config
 
