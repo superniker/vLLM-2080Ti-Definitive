@@ -883,9 +883,13 @@ class GatedDeltaNetAttention(PluggableLayer, MambaBase):
         normed_3d = normed.reshape(z_shape_og)
         proj_in = rearrange(normed_3d, "... h d -> ... (h d)")
         _wp = getattr(self.out_proj, "qweight", None)
-        if _wp is not None:
-            # [FORK 兼容] 量化层(AWQ/GGUF):qweight 是 int32 打包,不能转成它的 dtype;
-            # AWQ 内核要求 FP16 输入;GGUF FP32 模式(VLLM_GGUF_FP32=1)保持 FP32
+        _has_w = hasattr(self.out_proj, "weight")
+        if _wp is not None or not _has_w:
+            # [FORK 兼容] 量化层输入必须 fp16:
+            #   AWQ/GGUF 有 qweight(int32 打包,不能转成它的 dtype);
+            #   CT 量化层(compressed-tensors WNA16)无 weight 属性(只有
+            #   weight_packed/scale/shape),Marlin 内核同样要求 FP16 输入;
+            #   GGUF FP32 模式(VLLM_GGUF_FP32=1)保持 FP32
             if os.getenv("VLLM_GGUF_FP32", "0") != "1":
                 proj_in = proj_in.to(torch.float16)
         else:
