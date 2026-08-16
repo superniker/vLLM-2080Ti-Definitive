@@ -704,8 +704,9 @@ class EngineArgs:
         # support `EngineArgs(compilation_config={...})`
         # without having to manually construct a
         # CompilationConfig object
-        # [FORK 兼容] 修复: CLI 传入的 JSON 字符串未被转成 dict,
-        # 导致 compilation_config 参数静默失效(总是用默认 mode=3 编译)
+        # [FORK compatibility] Fix: JSON strings passed via CLI were not
+        # converted to dict, silently disabling compilation_config
+        # (always compiled with default mode=3)
         if isinstance(self.compilation_config, str):
             self.compilation_config = json.loads(self.compilation_config)
         if isinstance(self.compilation_config, dict):

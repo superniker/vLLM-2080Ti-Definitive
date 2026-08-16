@@ -213,7 +213,8 @@ def _fused_mul_mat_gguf(
     # there is no need to call any kernel for fp16/bf16
     if qweight_type in UNQUANTIZED_TYPES:
         return x @ qweight.T
-    # GDN 精度修复:强制 fp32 反量化计算(跳过 MMQ fp16 内核的精度损失)
+    # GDN precision fix: force fp32 dequant computation (skips the precision
+    # loss of the MMQ fp16 kernel)
     if os.getenv("VLLM_GGUF_FP32", "0") == "1":
         block_size, type_size = gguf.GGML_QUANT_SIZES[qweight_type]
         shape = (qweight.shape[0], qweight.shape[1] // type_size * block_size)
@@ -525,11 +526,11 @@ class GGUFLinearMethod(LinearMethodBase):
             )
             # (dim0_start, dim0_end, dim1_size)
             shard_offset_map = dict[str, tuple[int, int, int]]()
-            # Qwen3.5 GDN:attn_gate(z)在 GGUF 文件里排在 attn_qkv 之前,
-            # 导致 shard_id=[3,0,1,2] 且 data_container=[z,q,k,v];
-            # 必须按 shard id 顺序拼接,否则 qkv 与 z 错位
-            # (forward 按 [qkv,z] split)。start 用 shard id 顺序的累计行数,
-            # 不能依赖 data_container 的物理顺序。
+            # Qwen3.5 GDN: attn_gate (z) precedes attn_qkv in the GGUF file,
+            # so shard_id=[3,0,1,2] and data_container=[z,q,k,v];
+            # must concatenate in shard id order, otherwise qkv and z are
+            # misaligned (forward splits as [qkv,z]). start uses the running
+            # row count in shard id order, not data_container's physical order.
             cur_start = 0
             for idx in (sorted(shard_id) if all(isinstance(s, int) for s in shard_id) else shard_id):
                 data = data_container[shard_id_map[idx]]
@@ -558,9 +559,9 @@ class GGUFLinearMethod(LinearMethodBase):
             shard_id = ["q", "k", "v"] if "q" in shard_id else shard_id
             qweight = layer.qweight
             result = []
-            # Qwen3.5 GDN:attn_gate(z)先加载导致 shard_id=[3,0,1,2];
-            # 必须按 shard id 排序输出(q,k,v,z),否则 forward 的
-            # [qkv,z] split 拿到 [z,q,...] 错位。
+            # Qwen3.5 GDN: attn_gate (z) loads first, so shard_id=[3,0,1,2];
+            # must output in shard id order (q,k,v,z), otherwise forward's
+            # [qkv,z] split gets [z,q,...] misaligned.
             for idx in (sorted(shard_id) if all(isinstance(s, int) for s in shard_id) else shard_id):
                 start, end, offset = layer.qweight.shard_offset_map[idx]
                 qweight_type = layer.qweight_type.shard_weight_type[idx]

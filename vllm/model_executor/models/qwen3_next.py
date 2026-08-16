@@ -33,11 +33,14 @@ from vllm.model_executor.layers.layernorm import (
     RMSNorm,
 )
 
-# [FORK 兼容] GGUF 的 RMSNorm 权重已含 +1(llama.cpp 惯例,见 conversion/gemma.py norm_shift),
-# 必须用普通 RMSNorm 直接乘;safetensors 权重是原始 w(1+w 语义),用 GemmaRMSNorm。
-# 与上游 vLLM PR #31464/#37220 的 Gemma2/3 GGUF 修复一致。
-# 注意:不能用 vllm_config.quant_config 判断(GGUF 路径下它是 None),
-# 用 model_config.load_format;其他格式(safetensors/AWQ 等)默认走 GemmaRMSNorm 原版。
+# [FORK compatibility] GGUF RMSNorm weights already include +1 (llama.cpp
+# convention, see conversion/gemma.py norm_shift), so plain RMSNorm must be
+# used to multiply directly; safetensors weights are raw w (1+w semantics), so
+# use GemmaRMSNorm. Consistent with upstream vLLM PR #31464/#37220 Gemma2/3
+# GGUF fixes.
+# Note: cannot branch on vllm_config.quant_config (it is None on the GGUF
+# path); use model_config.load_format. Other formats (safetensors/AWQ etc.)
+# default to the original GemmaRMSNorm.
 def _get_qwen3_next_rms_norm_cls(load_format) -> type:
     if load_format == "gguf":
         return RMSNorm
@@ -224,7 +227,7 @@ class Qwen3NextAttention(nn.Module):
         cache_config: CacheConfig | None = None,
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
-        load_format: str = "auto",  # [FORK 兼容] GGUF 时选普通 RMSNorm(权重含 +1)
+        load_format: str = "auto",  # [FORK compatibility] pick plain RMSNorm for GGUF (weights include +1)
     ) -> None:
         super().__init__()
         self.config = config
@@ -352,9 +355,10 @@ class Qwen3NextDecoderLayer(nn.Module):
         model_config = vllm_config.model_config
         cache_config = vllm_config.cache_config
         quant_config = vllm_config.quant_config
-        # [FORK 兼容] GGUF 加载时所有 RMSNorm 权重含 +1,需普通 RMSNorm
-        # multiproc worker 反序列化后 load_config 可能丢失,兜底为 gguf
-        # (qwen35 目前只有 GGUF 加载路径)
+        # [FORK compatibility] All RMSNorm weights include +1 when loaded
+        # from GGUF, so plain RMSNorm is needed. load_config may be lost after
+        # multiproc worker deserialization; fall back to gguf (qwen35 currently
+        # only has a GGUF load path)
         try:
             load_format = vllm_config.load_config.load_format
         except Exception:
@@ -377,7 +381,7 @@ class Qwen3NextDecoderLayer(nn.Module):
                 cache_config=cache_config,
                 quant_config=quant_config,
                 prefix=f"{prefix}.self_attn",
-                load_format=load_format,  # [FORK 兼容] GGUF 时 q/k_norm 用普通 RMSNorm
+                load_format=load_format,  # [FORK compatibility] q/k_norm use plain RMSNorm for GGUF
             )
         else:
             raise ValueError(f"Invalid layer_type {self.layer_type}")

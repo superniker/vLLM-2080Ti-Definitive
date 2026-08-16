@@ -1211,9 +1211,11 @@ def get_kernel_options(
         block_m_candidate = max(block_m_candidate, block_lower_bound)
         block_n_candidate = max(block_n_candidate, block_lower_bound)
 
-        # [FORK 兼容] triton 的 tl.arange 要求 2 幂;视觉 BLOCK_N 会取到
-        # 784(图像 28x28 patches,非 2 幂)导致 'arange range must be power of 2'。
-        # 向上取 2 幂(1024),代价是共享内存略增,但避免崩
+        # [FORK compatibility] triton's tl.arange requires a power of 2; the
+        # vision BLOCK_N can be 784 (28x28 image patches, not a power of 2)
+        # which triggers 'arange range must be power of 2'. Round up to a power
+        # of 2 (1024) at the cost of slightly more shared memory, but avoids
+        # the crash
         block_m_candidate = 2 ** max(1, (block_m_candidate - 1).bit_length())
         block_n_candidate = 2 ** max(1, (block_n_candidate - 1).bit_length())
 

@@ -117,7 +117,7 @@ class GGUFModelLoader(BaseModelLoader):
         # models, this returns config itself.
         text_config = config.get_text_config()
         model_type = config.model_type
-        # Qwen3_5Config 总是创建 vision_config,需以 mmproj 文件为准
+        # Qwen3_5Config always creates vision_config; rely on the mmproj file
         is_multimodal = detect_gguf_multimodal(model_config.model) is not None
         gguf_to_hf_name_map = {}
         sideload_params: list[re.Pattern] = []
@@ -227,9 +227,11 @@ class GGUFModelLoader(BaseModelLoader):
                     config, trust_remote_code=model_config.trust_remote_code
                 )
             except ValueError:
-                # Qwen3_5Config 未注册到 transformers AutoModel(GGUF qwen35 场景)。
-                # 用 Qwen3NextForCausalLM 生成文本参数名映射;视觉塔参数名
-                # 由下方手动补(model.visual.*,333 个,与 AWQ 权重一致)
+                # Qwen3_5Config is not registered with transformers AutoModel
+                # (GGUF qwen35 scenario). Use Qwen3NextForCausalLM to generate
+                # the text parameter name mapping; vision tower parameter names
+                # are added manually below (model.visual.*, 333 in total,
+                # matching the AWQ weights)
                 logger.info(
                     "AutoModel 无法识别 %s,改用 Qwen3NextForCausalLM 生成参数名映射",
                     type(config).__name__,
@@ -248,19 +250,21 @@ class GGUFModelLoader(BaseModelLoader):
                         for k, v in vars(tc).items()
                         if not k.startswith("_") and k != "model_type"
                     },
-                    # Qwen3.5-27B 是稠密模型:关掉 Qwen3Next 默认的 MoE 分支
+                    # Qwen3.5-27B is a dense model: disable Qwen3Next's default MoE branch
                     num_experts=1,
                     num_experts_per_tok=1,
                     mlp_only_layers=[],
-                    decoder_sparse_step=10**9,  # 全层 dense MLP
+                    decoder_sparse_step=10**9,  # dense MLP on all layers
                 )
                 dummy_model = Qwen3NextForCausalLM(q3n)
 
         state_dict = dummy_model.state_dict()
-        # [FORK 兼容] Qwen3.5 GGUF 多模态:文本参数名对齐多模态模型
-        # (model.language_model.layers.N.xxx,与 AWQ 权重命名一致);
-        # 326-338 行的前缀处理会把它转成 gguf-py 认识的 model.layers.N.xxx,
-        # 而映射表值(load_weights 收到的名)能匹配 Qwen3_5ForConditionalGeneration
+        # [FORK compatibility] Qwen3.5 GGUF multimodal: align text parameter
+        # names with the multimodal model (model.language_model.layers.N.xxx,
+        # matching AWQ weight naming); the prefix handling around lines 326-338
+        # converts them to the gguf-py style model.layers.N.xxx, while the map
+        # values (names received by load_weights) match
+        # Qwen3_5ForConditionalGeneration
         if is_multimodal:
             state_dict = {
                 (
@@ -270,11 +274,12 @@ class GGUFModelLoader(BaseModelLoader):
                 ): tensor
                 for name, tensor in state_dict.items()
             }
-        # [FORK 兼容] Qwen3.5 GGUF 多模态:补视觉塔参数名(dummy 是纯文本类,
-        # 无视觉参数;mmproj 权重映射需要 model.visual.* 键)。
-        # 结构取自 vLLM Qwen3_VisionTransformer(Qwen3.5 视觉塔,与 AWQ 权重一致):
-        # blocks(27 层):attn.qkv/attn.proj/mlp.linear_fc1/fc2/norm1/norm2;
-        # merger:linear_fc1/fc2/norm;patch_embed.proj;pos_embed
+        # [FORK compatibility] Qwen3.5 GGUF multimodal: add vision tower
+        # parameter names (the dummy is text-only with no vision params; mmproj
+        # weight mapping needs model.visual.* keys). Structure taken from
+        # vLLM Qwen3_VisionTransformer (Qwen3.5 vision tower, matching AWQ
+        # weights): blocks (27 layers): attn.qkv/attn.proj/mlp.linear_fc1/fc2/
+        # norm1/norm2; merger: linear_fc1/fc2/norm; patch_embed.proj; pos_embed
         if is_multimodal:
             _depth = getattr(config.vision_config, "depth", 27)
             _vnames = [
@@ -303,8 +308,9 @@ class GGUFModelLoader(BaseModelLoader):
             for _vn in _vnames:
                 if _vn not in state_dict:
                     state_dict[_vn] = torch.empty(0)
-        # Qwen3.5 GGUF:ssm_alpha/ssm_beta 分开存储,vLLM 的 Qwen3_5 load_weights
-        # 按 in_proj_b/shard0 + in_proj_a/shard1 分片加载,把合并名拆开
+        # Qwen3.5 GGUF: ssm_alpha/ssm_beta are stored separately; vLLM's
+        # Qwen3_5 load_weights shards them as in_proj_b/shard0 +
+        # in_proj_a/shard1, so split the merged names
         if model_type == "qwen35":
             renamed: dict = {}
             for name, tensor in state_dict.items():
@@ -313,8 +319,9 @@ class GGUFModelLoader(BaseModelLoader):
                     renamed[base + "in_proj_b.weight"] = tensor
                     renamed[base + "in_proj_a.weight"] = tensor
                 elif name.endswith(".linear_attn.in_proj_qkvz.weight"):
-                    # vLLM 按 in_proj_qkv(shard 0,1,2)+ in_proj_z(shard 3)分片加载;
-                    # GGUF 的 attn_qkv→in_proj_qkv、attn_gate→in_proj_z
+                    # vLLM loads shards as in_proj_qkv (shards 0,1,2) +
+                    # in_proj_z (shard 3); GGUF's attn_qkv -> in_proj_qkv,
+                    # attn_gate -> in_proj_z
                     base = name[: -len("in_proj_qkvz.weight")]
                     renamed[base + "in_proj_qkv.weight"] = tensor
                     renamed[base + "in_proj_z.weight"] = tensor
@@ -397,8 +404,9 @@ class GGUFModelLoader(BaseModelLoader):
             gguf_name = None
             # Priority 1: Search vision/projector parameters for multimodal models
             if vision_name_map is not None:
-                # [FORK 兼容] Qwen3.5 GGUF 多模态:gguf-py 视觉键用
-                # vision_tower.* 风格,vLLM/AWQ 用 model.visual.*,转换后再查
+                # [FORK compatibility] Qwen3.5 GGUF multimodal: gguf-py vision
+                # keys use vision_tower.* style while vLLM/AWQ use
+                # model.visual.*; convert before lookup
                 vision_base = base_name
                 if vision_base.startswith("model.visual."):
                     vision_base = (
@@ -415,8 +423,9 @@ class GGUFModelLoader(BaseModelLoader):
                 gguf_name = text_name_map.get_name(base_name)
 
             if gguf_name is None:
-                # [FORK 兼容] Qwen3.5 GGUF 多模态:gguf-py MMPROJ 映射缺失项,
-                # 手动补(视觉 mlp 的 ffn_up/down、pos_embed、merger)
+                # [FORK compatibility] Qwen3.5 GGUF multimodal: gguf-py MMPROJ
+                # mapping gaps filled manually (visual mlp ffn_up/down,
+                # pos_embed, merger)
                 if vision_name_map is not None:
                     _vparts = vision_base.split(".")
                     if (
@@ -441,9 +450,10 @@ class GGUFModelLoader(BaseModelLoader):
             if gguf_name is None:
                 return None
 
-            # suffix 为空(裸参数如 A_log/dt_bias)时不能加尾点,
-            # 否则映射键 'blk.N.ssm_a.' 与 GGUF tensor 名 'blk.N.ssm_a' 不匹配;
-            # 但以 bias 结尾的裸参数(如 dt_bias)对应的 GGUF tensor 名带 .bias
+            # When suffix is empty (bare params like A_log/dt_bias), don't
+            # append a trailing dot: the map key 'blk.N.ssm_a.' would not match
+            # the GGUF tensor name 'blk.N.ssm_a'; but bare params ending in
+            # bias (e.g. dt_bias) map to GGUF tensor names with .bias
             if not suffix:
                 if base_name.endswith("bias"):
                     return gguf_name + ".bias"
@@ -529,15 +539,17 @@ class GGUFModelLoader(BaseModelLoader):
             assert mmproj_file is not None, (
                 "Could not find mm_proj file for multimodal GGUF model"
             )
-            # 注意:mmproj 的 F16 权重 GGUFReader.data 已是 [out, in]
-            # (vLLM 线性层布局),tensor.shape 元数据才是 [in, out],勿转置
+            # Note: mmproj F16 weights are already [out, in] in
+            # GGUFReader.data (vLLM linear layer layout); only the
+            # tensor.shape metadata is [in, out] - do not transpose
             for _name, _tensor in gguf_quant_weights_iterator(
                 mmproj_file, gguf_to_hf_name_map
             ):
                 if _name.endswith(".patch_embed.proj.weight"):
-                    # GGUF conv 4D(1152,3,16,16)单帧共享权重;vLLM Conv3d
-                    # 是 5D(1152,3,2,16,16)(temporal_patch_size=2,与 AWQ 一致),
-                    # 2 帧共享权重:补时间维后复制 → (1152,3,2,16,16)
+                    # GGUF conv is 4D (1152,3,16,16) single-frame shared
+                    # weight; vLLM Conv3d is 5D (1152,3,2,16,16)
+                    # (temporal_patch_size=2, matching AWQ). The 2 frames share
+                    # weights: unsqueeze the time dim and repeat -> (1152,3,2,16,16)
                     _tensor = _tensor.unsqueeze(2).repeat(1, 1, 2, 1, 1)
                 yield _name, _tensor
 
@@ -555,9 +567,9 @@ class GGUFModelLoader(BaseModelLoader):
     def _iter_lm_head_unquantized(
         self, base_iter: Generator[tuple[str, torch.Tensor], None, None]
     ) -> Generator[tuple[str, torch.Tensor], None, None]:
-        """GGUF 的 lm_head(output.weight)常以量化类型存储(Q6_K 等),但
-        ParallelLMHead 不支持 qweight_type 参数:拦截 qweight_type/qweight,
-        反量化后以 lm_head.weight 产出。"""
+        """GGUF lm_head (output.weight) is usually stored quantized (Q6_K etc.),
+        but ParallelLMHead doesn't support the qweight_type parameter: intercept
+        qweight_type/qweight, dequantize, and emit as lm_head.weight."""
         qweight_type: int | None = None
         embed_qwt_type: gguf.GGMLQuantizationType | None = None
         for name, tensor in base_iter:
@@ -569,9 +581,11 @@ class GGUFModelLoader(BaseModelLoader):
                 continue
             if name == "lm_head.qweight":
                 assert qweight_type is not None
-                # ops.ggml_dequantize 仅 CUDA;CPU 上用 gguf.dequantize 反量化
-                # 内存纪律:dequant 是 float32(248320x5120 ≈ 5GB),转 fp16 后立即释放,
-                # 严禁缓存复用(曾致双表 10GB 驻留 + 双 worker → user cgroup OOM)
+                # ops.ggml_dequantize is CUDA-only; use gguf.dequantize on CPU.
+                # Memory discipline: dequant is float32 (248320x5120 ~= 5GB);
+                # cast to fp16 and release immediately, never cache/reuse
+                # (previously caused two 10GB tables + dual workers ->
+                # user cgroup OOM)
                 dequant = gguf.dequantize(
                     tensor.numpy(), gguf.GGMLQuantizationType(qweight_type)
                 )
@@ -579,9 +593,11 @@ class GGUFModelLoader(BaseModelLoader):
                 del dequant
                 name = "lm_head.weight"
             elif name == "model.embed_tokens.qweight":
-                # llama.cpp 的 embed = token_embd.weight(Q4_K),lm_head = output.weight(Q6_K),
-                # 两表不相关(corr≈0)。此前误复用 output.weight 做 embed,导致整个链从输入就错。
-                # 现在正确反量化 token_embd.weight 作为 embed 表。
+                # In llama.cpp, embed = token_embd.weight (Q4_K) and lm_head =
+                # output.weight (Q6_K); the two tables are unrelated (corr~=0).
+                # Previously output.weight was wrongly reused as embed, breaking
+                # the whole chain from the input. Now token_embd.weight is
+                # dequantized correctly as the embed table.
                 assert embed_qwt_type is not None
                 dequant = gguf.dequantize(
                     tensor.numpy(), gguf.GGMLQuantizationType(embed_qwt_type)
@@ -590,12 +606,13 @@ class GGUFModelLoader(BaseModelLoader):
                 del dequant
                 name = "model.embed_tokens.weight"
             elif name.endswith(".linear_attn.conv1d.weight"):
-                # vLLM GDN conv1d 是 [conv_dim, 1, kernel](unsqueeze 过),
-                # GGUF 产出 [channels, kernel] 2D,补上中间维
+                # vLLM GDN conv1d is [conv_dim, 1, kernel] (unsqueezed);
+                # GGUF emits 2D [channels, kernel]; insert the middle dim
                 tensor = tensor.unsqueeze(1)
             elif name.endswith(".linear_attn.A_log"):
-                # GGUF 的 ssm_a 是 llama.cpp 预计算的 -exp(A_log)(小负值),
-                # vLLM forward 里再 -exp(A_log) 会双重 exp;转换回原始 log 值
+                # GGUF ssm_a is llama.cpp's precomputed -exp(A_log) (small
+                # negative values); applying -exp(A_log) again in vLLM's
+                # forward would double-exp; convert back to the raw log value
                 tensor = torch.log(-tensor.float())
             yield name, tensor
 
@@ -632,12 +649,14 @@ class GGUFModelLoader(BaseModelLoader):
             for name, weight_type in weight_type_map.items()
             if weight_type in ("F32", "F16", "BF16") and name.endswith(".weight")
         ]
-        # lm_head/output 在 GGUF 里常以量化类型存储(Q6_K 等),但 ParallelLMHead
-        # 不支持 qweight_type 元数据,强制按未量化(反量化)加载
+        # lm_head/output is usually stored quantized in GGUF (Q6_K etc.), but
+        # ParallelLMHead doesn't support qweight_type metadata; force loading
+        # as unquantized (dequantized)
         if "lm_head" not in unquant_names:
             unquant_names.append("lm_head")
-        # embed_tokens 同理:Qwen3_5 的 GGUFEmbeddingMethod 对 qweight_type
-        # 处理有缺陷(参数未创建),强制反量化走普通 weight 加载
+        # Same for embed_tokens: Qwen3_5's GGUFEmbeddingMethod mishandles
+        # qweight_type (the parameter is never created); force dequantization
+        # and load as a plain weight
         if "model.embed_tokens" not in unquant_names:
             unquant_names.append("model.embed_tokens")
         logger.debug("GGUF unquantized modules: %s", unquant_names)

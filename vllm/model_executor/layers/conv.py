@@ -219,7 +219,7 @@ class Conv3dLayer(ConvLayerBase):
     def _forward_mulmat(self, x: torch.Tensor) -> torch.Tensor:
         assert x.dim() == 5
         B, C, T, H, W = x.shape
-        if B > 100:  # 临时探针
+        if B > 100:  # temporary probe
             print(
                 f"[DBG-CONV] x={tuple(x.shape)} kernel={tuple(self.kernel_size)} "
                 f"input_size={self.input_size}",

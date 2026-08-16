@@ -186,8 +186,9 @@ class Qwen3_5Config(PretrainedConfig):
         if isinstance(text_config, dict):
             self.text_config = self.sub_configs["text_config"](**text_config)
         elif text_config is None:
-            # GGUF 加载时字段是顶层 kwargs(hidden_size 等),转发给 text_config,
-            # 否则 Qwen3_5TextConfig 全部用默认值(hidden=4096 等)
+            # When loading from GGUF the fields arrive as top-level kwargs
+            # (hidden_size etc.); forward them to text_config, otherwise
+            # Qwen3_5TextConfig uses all defaults (hidden=4096 etc.)
             _text_keys = (
                 "vocab_size", "hidden_size", "intermediate_size",
                 "num_hidden_layers", "num_attention_heads",

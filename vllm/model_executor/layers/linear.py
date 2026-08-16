@@ -707,8 +707,9 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
         if is_gguf_weight_type:
             if loaded_shard_id is not None:
                 if isinstance(loaded_shard_id, tuple):
-                    # Qwen3.5 GDN in_proj_qkv(shard 0,1,2) 等合并分片:
-                    # 同一量化类型广播到各 shard(键用 tuple,apply 按 idx 查)
+                    # Merged shards such as Qwen3.5 GDN in_proj_qkv (shards 0,1,2):
+                    # broadcast the same quant type to each shard (key is a
+                    # tuple; apply looks up by idx)
                     for sid in loaded_shard_id:
                         param.data[sid].copy_(loaded_weight)
                         param.shard_weight_type[sid] = loaded_weight.item()
@@ -724,10 +725,11 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
         if is_gguf_weight:
             output_dim = getattr(param, "output_dim", None)
             if isinstance(loaded_shard_id, tuple):
-                # 合并 shard(如 Qwen3.5 GDN in_proj_qkv = [q,k,v] 合并存一个
-                # GGUF tensor attn_qkv):必须按 output_sizes 边界切分,再对
-                # 每个 shard 单独做 TP 分片;整体 narrow 会导致 q/k/v 错位
-                # (vLLM 官方只测过 Gemma2/3,未覆盖 Qwen3Next GGUF 布局)。
+                # Merged shards (e.g. Qwen3.5 GDN in_proj_qkv = [q,k,v] stored
+                # as a single GGUF tensor attn_qkv): must split at output_sizes
+                # boundaries, then apply TP sharding per shard; narrowing the
+                # whole tensor would misalign q/k/v (upstream vLLM only tested
+                # Gemma2/3 and doesn't cover the Qwen3Next GGUF layout).
                 cur_offset = 0
                 for sid in loaded_shard_id:
                     osize = self.output_sizes[sid]

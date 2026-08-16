@@ -855,7 +855,7 @@ class Qwen3_VisionTransformer(nn.Module):
             else:
                 param = params_dict[name]
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
-                if name.startswith(("blocks.", "patch", "pos_embed", "merger")):  # 临时探针
+                if name.startswith(("blocks.", "patch", "pos_embed", "merger")):  # temporary probe
                     print(
                         f"[DBG-VIS] {name}: param={tuple(param.data.shape)} "
                         f"loaded={tuple(loaded_weight.shape)}",

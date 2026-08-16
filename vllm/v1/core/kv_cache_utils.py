@@ -1032,8 +1032,9 @@ def unify_kv_cache_spec_page_size(
         else:
             layer_page_size = layer_spec.page_size_bytes
             if max_page_size % layer_page_size != 0:
-                # 不能通过 block_size 整除时:对支持 padding 的层(state-based
-                # 如 Mamba)直接把页填充到 max_page_size
+                # When divisibility by block_size can't be achieved: for
+                # layers supporting padding (state-based, e.g. Mamba) pad the
+                # page directly to max_page_size
                 if hasattr(layer_spec, "page_size_padded"):
                     new_kv_cache_spec[layer_name] = replace(
                         layer_spec, page_size_padded=max_page_size

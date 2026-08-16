@@ -197,7 +197,7 @@ class _ColumnvLLMParameter(BasevLLMParameter):
             self.output_dim, shard_id_int * shard_size, shard_size
         )
 
-        if param_data.shape != loaded_weight.shape:  # 临时探针
+        if param_data.shape != loaded_weight.shape:  # temporary probe
             print(
                 f"[DBG-QKV] shard={shard_id} param_data={tuple(param_data.shape)} "
                 f"loaded={tuple(loaded_weight.shape)} full={tuple(self.data.shape)} "
@@ -234,7 +234,7 @@ class RowvLLMParameter(BasevLLMParameter):
         if len(loaded_weight.shape) == 0:
             loaded_weight = loaded_weight.reshape(1)
 
-        if self.data.shape != loaded_weight.shape:  # 临时探针
+        if self.data.shape != loaded_weight.shape:  # temporary probe
             print(
                 f"[DBG-ROW] data={tuple(self.data.shape)} loaded={tuple(loaded_weight.shape)} "
                 f"input_dim={self.input_dim} tp={self.tp_rank} shard={shard_size}",

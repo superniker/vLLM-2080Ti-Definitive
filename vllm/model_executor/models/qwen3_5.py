@@ -41,8 +41,9 @@ from vllm.model_executor.layers.layernorm import (
     RMSNorm,
 )
 
-# [FORK 兼容] GGUF 的 RMSNorm 权重含 +1(llama.cpp 惯例),用普通 RMSNorm;
-# safetensors/AWQ 等用 GemmaRMSNorm 原版(1+w 语义)。
+# [FORK compatibility] GGUF RMSNorm weights already include +1 (llama.cpp
+# convention), so use plain RMSNorm; safetensors/AWQ etc. use the original
+# GemmaRMSNorm (1+w semantics).
 def _get_qwen3_5_rms_norm_cls(load_format) -> type:
     if load_format == "gguf":
         return RMSNorm
@@ -141,8 +142,9 @@ class Qwen3_5DecoderLayer(Qwen3NextDecoderLayer):
             if override_quant_config is None
             else override_quant_config
         )
-        # [FORK 兼容] GGUF 时 RMSNorm 权重含 +1,用普通 RMSNorm;
-        # multiproc worker 反序列化后 load_config 可能丢失,兜底为 gguf
+        # [FORK compatibility] GGUF RMSNorm weights include +1, so use plain
+        # RMSNorm; load_config may be lost after multiproc worker
+        # deserialization, fall back to gguf
         try:
             _lf = vllm_config.load_config.load_format
         except Exception:
@@ -258,7 +260,8 @@ class Qwen3_5Model(Qwen3NextModel):
         )
 
         if get_pp_group().is_last_rank:
-            # [FORK 兼容] GGUF 时用普通 RMSNorm(权重含 +1);worker 反序列化兜底 gguf
+            # [FORK compatibility] Use plain RMSNorm for GGUF (weights include
+            # +1); fall back to gguf after worker deserialization
             try:
                 _lf = vllm_config.load_config.load_format
             except Exception:
@@ -552,7 +555,8 @@ class Qwen3_5ForCausalLMBase(
 
     @classmethod
     def get_mamba_state_copy_func(cls) -> tuple[MambaStateCopyFunc, MambaStateCopyFunc]:
-        # [FORK 兼容] GGUF 纯文本(ForCausalLM)也需 SSM 状态拷贝函数(原版只在多模态类里)
+        # [FORK compatibility] GGUF text-only (ForCausalLM) also needs SSM
+        # state copy functions (upstream only defines them in the multimodal class)
         return MambaStateCopyFuncCalculator.gated_delta_net_state_copy_func()
 
     @classmethod
@@ -570,8 +574,9 @@ class Qwen3_5ForCausalLMBase(
     def get_mamba_state_shape_from_config(
         cls, vllm_config: "VllmConfig"
     ) -> tuple[tuple[int, int], tuple[int, int, int]]:
-        # [FORK 兼容] 纯文本 ForCausalLM 需自行实现(原版只在多模态类里),
-        # 供 IsHybrid 推导 mamba_block_size(GDN linear_attn 状态缓存)
+        # [FORK compatibility] Text-only ForCausalLM must implement these
+        # itself (upstream only defines them in the multimodal class), so
+        # IsHybrid can derive mamba_block_size (GDN linear_attn state cache)
         parallel_config = vllm_config.parallel_config
         hf_config = vllm_config.model_config.hf_text_config
         tp_size = parallel_config.tensor_parallel_size
@@ -592,9 +597,10 @@ class Qwen3_5ForCausalLMBase(
 
 
 class Qwen3_5ForCausalLM(Qwen3_5ForCausalLMBase, IsHybrid):
-    # [FORK 兼容] GGUF 纯文本(Qwen3_5ForCausalLM)也含 linear_attn 混合层,
-    # 必须标记 IsHybrid 才能推导 mamba_block_size(GDN linear_attn 状态缓存),
-    # 否则 get_kv_cache_spec 断言 mamba_block_size is not None 崩溃。
+    # [FORK compatibility] GGUF text-only (Qwen3_5ForCausalLM) also contains
+    # linear_attn hybrid layers; must be marked IsHybrid so mamba_block_size
+    # can be derived (GDN linear_attn state cache), otherwise get_kv_cache_spec
+    # crashes asserting mamba_block_size is not None.
     pass
 
 
