@@ -29,12 +29,13 @@ NUM_WARPS = [2, 4, 8, 16]
         "IS_VARLEN": lambda args: args["cu_seqlens"] is not None,
     }
 )
+# [FORK] 固定 GDN kernel 配置 (修正版):
+# 2026-08-16 微基准: BV32/w4 全 shape 最优 (32K: 112ms vs 原 BV32/w2 145ms, -23%;
+# BV64 反而更慢 136-249ms — 与 chunk_o 相反)。缩 autotune 无效 (key 不含 T,
+# warmup 假最优被复用), 直接固定。
 @triton.autotune(
     configs=[
-        triton.Config({"BV": BV}, num_warps=num_warps, num_stages=num_stages)
-        for num_warps in [2, 4]
-        for num_stages in [2, 3, 4]
-        for BV in [32, 64]
+        triton.Config({"BV": 32}, num_warps=4, num_stages=2)  # 微基准最优
     ],
     key=["H", "K", "V", "BT"],
     use_cuda_graph=use_cuda_graph,
