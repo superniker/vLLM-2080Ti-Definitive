@@ -212,15 +212,27 @@ class HybridAttentionMambaModelConfig(VerifyAndUpdateConfig):
         # See issue: https://github.com/vllm-project/vllm/issues/37554
 
         if cache_config.calculate_kv_scales:
-            logger.warning(
-                "Disabling calculate_kv_scales for hybrid model '%s'. "
-                "Hybrid models with recurrent layers (GDN, Mamba, SSM) "
-                "produce unreliable KV cache scales during the "
-                "calibration pass because recurrent state is "
-                "uninitialized. Using default scale of 1.0 instead.",
-                vllm_config.model_config.model,
-            )
-            cache_config.calculate_kv_scales = False
+            # [FORK-PORT] PR#41505: int8_per_tensor 保留动态 scale。
+            # fp8 对 hybrid 禁用是 issue #37554 (校准期 recurrent state 未初始化
+            # 会污染 fp8 scale); int8 路径同样受此影响, 但测试需要真实 scale,
+            # 校准请求用真实长文本 prefill 来规避。fp8 维持官方禁用行为。
+            if cache_config.cache_dtype == "int8_per_tensor":
+                logger.info(
+                    "Keeping calculate_kv_scales for int8_per_tensor KV on "
+                    "hybrid model '%s' (FORK-PORT PR#41505; calibrate on real "
+                    "long prefill).",
+                    vllm_config.model_config.model,
+                )
+            else:
+                logger.warning(
+                    "Disabling calculate_kv_scales for hybrid model '%s'. "
+                    "Hybrid models with recurrent layers (GDN, Mamba, SSM) "
+                    "produce unreliable KV cache scales during the "
+                    "calibration pass because recurrent state is "
+                    "uninitialized. Using default scale of 1.0 instead.",
+                    vllm_config.model_config.model,
+                )
+                cache_config.calculate_kv_scales = False
 
         # Enable FULL_AND_PIECEWISE by default
         MambaModelConfig.verify_and_update_config(vllm_config)

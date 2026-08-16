@@ -46,6 +46,9 @@ class KVQuantMode(IntEnum):
     INT8_PER_TOKEN_HEAD = 2  # per-token-head dynamic scales for int8
     FP8_PER_TOKEN_HEAD = 3  # per-token-head dynamic scales for fp8
     NVFP4 = 4  # packed fp4 data + fp8 block scales
+    # [FORK-PORT] PR#41505 int8_per_tensor: 5 = symmetric INT8 per-tensor scale KV
+    # (原生 int→float 转换, sm_75 无 FP8 硬件时唯一 8bit KV 路径; 上游未合并, 见研究文档)
+    INT8_PER_TENSOR = 5  # per-tensor scales with int8 storage
 
     @property
     def is_per_token_head(self) -> bool:
@@ -69,6 +72,8 @@ def get_kv_quant_mode(kv_cache_dtype: str) -> KVQuantMode:
         return KVQuantMode.FP8_PER_TOKEN_HEAD
     if kv_cache_dtype == "nvfp4":
         return KVQuantMode.NVFP4
+    if kv_cache_dtype == "int8_per_tensor":
+        return KVQuantMode.INT8_PER_TENSOR
     if isinstance(kv_cache_dtype, str) and kv_cache_dtype.startswith("fp8"):
         return KVQuantMode.FP8_PER_TENSOR
     return KVQuantMode.NONE
