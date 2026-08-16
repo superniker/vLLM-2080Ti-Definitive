@@ -47,7 +47,8 @@ class KVQuantMode(IntEnum):
     FP8_PER_TOKEN_HEAD = 3  # per-token-head dynamic scales for fp8
     NVFP4 = 4  # packed fp4 data + fp8 block scales
     # [FORK-PORT] PR#41505 int8_per_tensor: 5 = symmetric INT8 per-tensor scale KV
-    # (原生 int→float 转换, sm_75 无 FP8 硬件时唯一 8bit KV 路径; 上游未合并, 见研究文档)
+    # (native int→float conversion, the only 8-bit KV path on sm_75 without FP8
+    # hardware; not merged upstream, see research docs)
     INT8_PER_TENSOR = 5  # per-tensor scales with int8 storage
 
     @property

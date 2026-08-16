@@ -336,8 +336,9 @@ class FlashInferBackend(AttentionBackend):
         "fp8_e4m3",
         "fp8_e5m2",
         "nvfp4",
-        # [FORK] int8_per_tensor: FlashInfer 内核无 int8 分支, 在 forward 里
-        # 反量化成 fp16 临时 buffer 再喂内核 (KV 存储仍减半, 反量化开销 ~带宽)
+        # [FORK] int8_per_tensor: FlashInfer kernels have no int8 path, so we
+        # dequantize to a temporary fp16 buffer in forward before feeding the
+        # kernel (KV storage is still halved; dequantization is ~bandwidth-bound)
         "int8_per_tensor",
     ]
 
@@ -632,9 +633,10 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
             # storage dtype may not be the same as the op dtype (uint8 vs fp8_e4m3)
             self.is_kvcache_nvfp4 = self.cache_dtype == "nvfp4"
             if self.cache_dtype == "int8_per_tensor":
-                # [FORK] int8_per_tensor: FlashInfer 0.6.8 内核无 int8 分支,
-                # forward 里反量化成 fp16 临时 buffer 再喂内核; 这里告知
-                # FlashInfer 数据是 fp16 (plan 的 kv_data_type)。
+                # [FORK] int8_per_tensor: FlashInfer 0.6.8 kernels have no int8
+                # path; we dequantize to a temporary fp16 buffer in forward
+                # before feeding the kernel; tell FlashInfer the data is fp16
+                # here (the plan's kv_data_type).
                 self.kv_cache_dtype = torch.float16
             elif self.is_kvcache_nvfp4:
                 # For NVFP4, kv_cache_dtype stays as the string "nvfp4"
@@ -1292,7 +1294,8 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
 class FlashInferImpl(AttentionImpl):
     can_return_lse_for_decode: bool = True
 
-    # [FORK] int8_per_tensor 未校准警告去重 (按层记录, 每层最多一次)
+    # [FORK] int8_per_tensor: dedupe uncalibrated warnings (tracked per layer,
+    # at most once per layer)
     _warned_uncalibrated_layers: set = set()
 
     def __init__(
@@ -1428,10 +1431,12 @@ class FlashInferImpl(AttentionImpl):
             f"got {query.dtype}"
         )
 
-        # [FORK] int8_per_tensor 走反量化路径 (数据已含 scale), 不折叠进 bmm
+        # [FORK] int8_per_tensor: use the dequantized path (data already
+        # includes scale), do not fold into bmm
         _is_int8_dequant = self.kv_cache_dtype == "int8_per_tensor"
-        # [FORK] int8_per_tensor: KV 已反量化为 fp16 真实值, 不能再传
-        # k_scale/v_scale 给 FlashInfer (否则双重 scale 导致乱码)
+        # [FORK] int8_per_tensor: KV has already been dequantized to real fp16
+        # values, so k_scale/v_scale must NOT be passed to FlashInfer (double
+        # scaling corrupts the output)
         _kv_scale = (1.0, 1.0) if _is_int8_dequant else (
             layer._k_scale_float, layer._v_scale_float)
         if self.bmm1_scale is None:
@@ -1498,17 +1503,23 @@ class FlashInferImpl(AttentionImpl):
             self.kv_cache_dtype
         ):
             if self.kv_cache_dtype == "int8_per_tensor":
-                # [FORK] int8_per_tensor: FlashInfer 内核无 int8 分支 (0.6.8
-                # 枚举有但模板无, 直接喂会 illegal address)。反量化成 fp16
-                # 临时 buffer (K/V 各自 scale), 存储仍为 int8 减半。
-                # 注意: 必须用张量 _k_scale/_v_scale (graph 输入, 回放时读到
-                # 校准后的值); 用 _k_scale_float (Python float) 会被 CUDA graph
-                # 捕获时折叠成常量 (启动时未校准 = 1.0) → 回放时数据错误。
+                # [FORK] int8_per_tensor: FlashInfer kernels have no int8 path
+                # (0.6.8 lists it in the enum but has no template; feeding int8
+                # directly causes illegal address). Dequantize to a temporary
+                # fp16 buffer (separate K/V scales); storage remains int8 and
+                # halved.
+                # Note: must use the tensor _k_scale/_v_scale (graph inputs,
+                # replay reads the calibrated values); using _k_scale_float
+                # (Python float) gets folded into a constant at CUDA graph
+                # capture (uncalibrated = 1.0 at startup) → wrong data on
+                # replay.
                 if layer._k_scale_float == 1.0:
-                    # [FORK] 首个请求为短请求 (<2048 tokens, 全走 CUDA graph)
-                    # 时校准被跳过 (calc_kv_scales 零值跳过 + graph 模式 return),
-                    # scale 保持 1.0 → 数据错误。按层去重 (每层最多一次),
-                    # 避免 graph 捕获阶段刷屏且真实请求时仍能看到提示。
+                    # [FORK] when the first request is short (<2048 tokens,
+                    # fully covered by CUDA graph), calibration is skipped
+                    # (calc_kv_scales zero-value skip + graph-mode return) and
+                    # scale stays 1.0 → data corruption. Dedupe per layer (at
+                    # most once per layer) to avoid spamming during graph
+                    # capture while still showing the hint on real requests.
                     if layer.layer_name not in \
                             FlashInferImpl._warned_uncalibrated_layers:
                         logger.warning(
@@ -1519,10 +1530,13 @@ class FlashInferImpl(AttentionImpl):
                         FlashInferImpl._warned_uncalibrated_layers.add(
                             layer.layer_name
                         )
-                # 反量化 (逐层临时分配, 层间串行执行自然释放; 实测峰值一层
-                # ~700MB, 256K 场景验证过)。张量 scale 是 graph 输入, 回放时
-                # 读到校准后的值; 用 _k_scale_float (Python float) 会被 CUDA
-                # graph 捕获折叠成常量 (启动时未校准 = 1.0) → 数据错误。
+                # Dequantization (per-layer temporary allocation, naturally
+                # freed as layers execute serially; measured peak ~700MB per
+                # layer, verified with 256K context). Tensor scales are graph
+                # inputs, replay reads the calibrated values; using
+                # _k_scale_float (Python float) gets folded into a constant at
+                # CUDA graph capture (uncalibrated = 1.0 at startup) → wrong
+                # data on replay.
                 _k = kv_cache[:, 0].to(torch.float16) * layer._k_scale.to(
                     torch.float16
                 )
@@ -1918,8 +1932,9 @@ class FlashInferImpl(AttentionImpl):
             k_cache = kv_cache[:, 0]
             v_cache = kv_cache[:, 1]
             if self.kv_cache_dtype == "int8_per_tensor":
-                # [FORK] int8_per_tensor: C++ reshape_and_cache_flash 无 int8
-                # 分支, 改用 Triton 版 (与 TRITON_ATTN 后端同款, 支持 int8+scale)
+                # [FORK] int8_per_tensor: C++ reshape_and_cache_flash has no
+                # int8 path; use the Triton version instead (same as the
+                # TRITON_ATTN backend, supports int8 + scale)
                 from vllm.v1.attention.ops.triton_reshape_and_cache_flash import (
                     triton_reshape_and_cache_flash,
                 )

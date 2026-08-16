@@ -1828,7 +1828,8 @@ class TritonAttentionImpl(AttentionImpl):
             key_cache, value_cache = kv_cache.unbind(1)
             if (
                 is_quantized_kv_cache(self.kv_cache_dtype)
-                # [FORK-PORT] PR#41505: int8_per_tensor 本身就是 int8, 无需 fp8 view
+                # [FORK-PORT] PR#41505: int8_per_tensor is already int8,
+                # no fp8 view needed
                 and self.kv_cache_dtype != "int8_per_tensor"
             ):
                 if key_cache.dtype != self.fp8_dtype:
@@ -1998,7 +1999,7 @@ class TritonAttentionImpl(AttentionImpl):
         key_cache, value_cache = kv_cache.unbind(1)
         if (
             is_quantized_kv_cache(self.kv_cache_dtype)
-            # [FORK-PORT] PR#41505: int8_per_tensor 本身就是 int8
+            # [FORK-PORT] PR#41505: int8_per_tensor is already int8
             and self.kv_cache_dtype != "int8_per_tensor"
         ):
             key_cache = key_cache.view(self.fp8_dtype)
