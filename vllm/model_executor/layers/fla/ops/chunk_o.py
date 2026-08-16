@@ -28,13 +28,13 @@ NUM_WARPS = [2, 4] if is_nvidia_hopper else [2, 4, 8]
         "IS_VARLEN": lambda args: args["cu_seqlens"] is not None,
     }
 )
+# [FORK] 固定 GDN kernel 配置 (修正版):
+# 2026-08-16 微基准: 原固定 BK32/BV32/w2 是可行集最差 (32K 慢 8.4x);
+# 缩 autotune (6 组合) 也无效 — key 不含 T, warmup(T=64) 搜索的假最优被所有
+# shape 复用。直接固定微基准最优 BK32/BV64/w4 (sm_75 共享内存 44KB 安全)
 @triton.autotune(
     configs=[
-        triton.Config({"BK": BK, "BV": BV}, num_warps=num_warps, num_stages=num_stages)
-        for BK in BKV_LIST
-        for BV in BKV_LIST
-        for num_warps in NUM_WARPS
-        for num_stages in [2, 3, 4]
+        triton.Config({"BK": 32, "BV": 64}, num_warps=4, num_stages=2)  # 32K 实测最优
     ],
     key=["H", "K", "V", "BT"],
 )
