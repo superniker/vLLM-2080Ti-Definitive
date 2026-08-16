@@ -77,7 +77,7 @@ PIN_MEMORY = "microsoft" not in " ".join(platform.uname()).lower()
 def is_quantized_kv_cache(kv_cache_dtype: str) -> bool:
     return (
         kv_cache_dtype.startswith("fp8")
-        # [FORK-PORT] PR#41505: int8_per_tensor 也是量化 KV (torch_utils 版)
+        # [FORK-PORT] PR#41505: int8_per_tensor is also a quantized KV dtype (torch_utils version)
         or kv_cache_dtype.startswith("int8")
         or kv_cache_dtype.endswith("per_token_head")
         or kv_cache_dtype == "nvfp4"

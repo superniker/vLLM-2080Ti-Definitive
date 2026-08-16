@@ -336,8 +336,8 @@ class FlashInferBackend(AttentionBackend):
         "fp8_e4m3",
         "fp8_e5m2",
         "nvfp4",
-        # [FORK] int8_per_tensor: FlashInfer 内核无 int8 分支, 在 forward 里
-        # 反量化成 fp16 临时 buffer 再喂内核 (KV 存储仍减半, 反量化开销 ~带宽)
+        # [FORK] int8_per_tensor: FlashInfer kernels lack an int8 branch; the
+        # forward pass dequantizes into a temp fp16 buffer (storage halved, cost ~bandwidth)
         "int8_per_tensor",
     ]
 
@@ -632,9 +632,9 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
             # storage dtype may not be the same as the op dtype (uint8 vs fp8_e4m3)
             self.is_kvcache_nvfp4 = self.cache_dtype == "nvfp4"
             if self.cache_dtype == "int8_per_tensor":
-                # [FORK] int8_per_tensor: FlashInfer 0.6.8 内核无 int8 分支,
-                # forward 里反量化成 fp16 临时 buffer 再喂内核; 这里告知
-                # FlashInfer 数据是 fp16 (plan 的 kv_data_type)。
+                # [FORK] int8_per_tensor: FlashInfer 0.6.8 kernels have no
+                # int8 branch; the forward pass dequantizes into a temporary
+                # fp16 buffer. Tell FlashInfer the data is fp16 (plan's kv_data_type).
                 self.kv_cache_dtype = torch.float16
             elif self.is_kvcache_nvfp4:
                 # For NVFP4, kv_cache_dtype stays as the string "nvfp4"
@@ -1277,10 +1277,11 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                     disable_split_kv=self.disable_split_kv,
                 )
                 attn_metadata.decode = FIDecode(wrapper=decode_wrapper)
-        # [FORK] int8_per_tensor decode 走 Triton 内核用 (FlashInfer 0.6.8
-        # 无 int8 decode 模板;全池反量化 5.7 tok/s vs Triton 42.8 tok/s)。
-        # 动态属性而非 dataclass 字段: _copy_tensor_tree 遍历 dataclass 字段
-        # 并 copy_, 视图与底层 buffer 同内存会触发 graph 捕获崩溃。
+        # [FORK] int8_per_tensor decode uses the Triton kernel (FlashInfer 0.6.8
+        # lacks an int8 decode template; whole-pool dequant 5.7 tok/s vs Triton
+        # 42.8 tok/s). Dynamic attribute, not a dataclass field: _copy_tensor_tree
+        # copy_()s dataclass fields; views aliasing the underlying buffer would
+        # crash CUDA graph capture.
         attn_metadata.seq_lens = seq_lens
         attn_metadata.block_table = block_table_tensor
         return attn_metadata
@@ -1298,7 +1299,7 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
 class FlashInferImpl(AttentionImpl):
     can_return_lse_for_decode: bool = True
 
-    # [FORK] int8_per_tensor 未校准警告去重 (按层记录, 每层最多一次)
+    # [FORK] Dedupe uncalibrated int8_per_tensor warnings (tracked per layer, at most once per layer)
     _warned_uncalibrated_layers: set = set()
 
     def __init__(
@@ -1366,9 +1367,10 @@ class FlashInferImpl(AttentionImpl):
         self.bmm2_scale: float | None = None
         self.o_sf_scale: float | None = None
 
-        # [FORK] int8 decode 走 Triton unified_attention 的 3D 分段参数
-        # (同 triton_attn.py): 长上下文 decode 用 3D 分段并行 softmax,
-        # 否则 2D 单段串行扫全部 KV → 32K 语境 decode 3.4 tok/s vs 26。
+        # [FORK] 3D segmented params for int8 decode via Triton unified_attention
+        # (same as triton_attn.py): long-context decode uses 3D segmented
+        # parallel softmax; otherwise the 2D single segment serially scans all
+        # KV (3.4 vs 26 tok/s at 32K context).
         self._decode_3d: dict | None = None
         if kv_cache_dtype == "int8_per_tensor":
             MIN_LAUNCH_GRID_SIZE_2D = 128
@@ -1383,7 +1385,7 @@ class FlashInferImpl(AttentionImpl):
                         capture_sizes,
                         key=lambda x: abs(x - seq_threshold),
                     )
-            headdim_padded = head_size  # 128 已是 2 的幂
+            headdim_padded = head_size  # 128 is already a power of 2
             self._decode_3d = {
                 "seq_threshold_3D": seq_threshold,
                 "num_par_softmax_segments": NUM_PAR_SOFTMAX_SEGMENTS,
@@ -1467,10 +1469,11 @@ class FlashInferImpl(AttentionImpl):
             f"got {query.dtype}"
         )
 
-        # [FORK] int8_per_tensor 走反量化路径 (数据已含 scale), 不折叠进 bmm
+        # [FORK] int8_per_tensor goes through the dequant path (data already
+        # includes the scale), so it is not folded into the bmm
         _is_int8_dequant = self.kv_cache_dtype == "int8_per_tensor"
-        # [FORK] int8_per_tensor: KV 已反量化为 fp16 真实值, 不能再传
-        # k_scale/v_scale 给 FlashInfer (否则双重 scale 导致乱码)
+        # [FORK] int8_per_tensor: KV is already dequantized to real fp16 values;
+        # do not pass k_scale/v_scale to FlashInfer (double scaling would corrupt output)
         _kv_scale = (1.0, 1.0) if _is_int8_dequant else (
             layer._k_scale_float, layer._v_scale_float)
         if self.bmm1_scale is None:
@@ -1536,32 +1539,36 @@ class FlashInferImpl(AttentionImpl):
         if self.kv_sharing_target_layer_name is None and is_quantized_kv_cache(
             self.kv_cache_dtype
         ):
-            # [FORK] decode 是否走 Triton 快速路径 (int8 且每请求 1 token 无 padding)
+            # [FORK] Whether decode takes the Triton fast path (int8, 1 token per request, no padding rows)
             _use_triton_decode = False
             if self.kv_cache_dtype == "int8_per_tensor":
-                # [FORK] int8_per_tensor: FlashInfer 内核无 int8 分支 (0.6.8
-                # 枚举有但模板无, 直接喂会 illegal address)。prefill 反量化成
-                # fp16 临时 buffer (K/V 各自 scale), 存储仍为 int8 减半;
-                # decode 走 Triton 内核 (原生 int8) 用原始 cache, 不反量化
-                # (decode-only 每步省全池反量化 ~17GB 流量, 5.7 → 42 tok/s)。
-                # 注意: 必须用张量 _k_scale/_v_scale (graph 输入, 回放时读到
-                # 校准后的值); 用 _k_scale_float (Python float) 会被 CUDA graph
-                # 捕获时折叠成常量 (启动时未校准 = 1.0) → 回放时数据错误。
-                # [FORK] 仅当 decode 为"每请求 1 token 且无 padding rows"
-                # (num_decode_tokens == num_decodes) 时走 Triton 快速路径;
-                # 推测解码或多 token 时回退 FlashInfer, 此时必须反量化
-                # (decode-only 回退也反量化, 否则 int8 cache 喂 FlashInfer 崩)。
+                # [FORK] int8_per_tensor: FlashInfer kernels have no int8 branch
+                # (0.6.8 lists the enum but ships no template; feeding int8 raw
+                # hits illegal address). Prefill dequantizes into a temporary
+                # fp16 buffer (separate K/V scales); storage stays halved int8.
+                # Decode uses the Triton kernel (native int8) on the raw cache,
+                # skipping dequant (saves ~17GB whole-pool dequant traffic per
+                # step, 5.7 → 42 tok/s). NOTE: pass the tensor _k_scale/_v_scale
+                # (graph inputs; replay reads calibrated values); _k_scale_float
+                # (Python float) is folded to a constant at capture (1.0 while
+                # uncalibrated) → wrong data on replay. [FORK] The Triton fast
+                # path runs only for "1 token per request with no padding rows"
+                # (num_decode_tokens == num_decodes); speculative decode or
+                # multi-token falls back to FlashInfer and must dequant (the
+                # decode-only fallback also dequantizes, or feeding int8 cache
+                # to FlashInfer crashes).
                 _use_triton_decode = (
                     attn_metadata.num_decode_tokens == attn_metadata.num_decodes
                 )
                 _kv_cache_int8 = kv_cache
                 if attn_metadata.num_prefill_tokens > 0 or not _use_triton_decode:
                     if layer._k_scale_float == 1.0:
-                        # [FORK] 首个请求为短请求 (<2048 tokens, 全走 CUDA
-                        # graph) 时校准被跳过 (calc_kv_scales 零值跳过 + graph
-                        # 模式 return), scale 保持 1.0 → 数据错误。按层去重
-                        # (每层最多一次), 避免 graph 捕获阶段刷屏且真实请求
-                        # 时仍能看到提示。
+                        # [FORK] When the first request is short (<2048 tokens,
+                        # fully CUDA-graphed), calibration is skipped (zero-value
+                        # skip in calc_kv_scales + early return in graph mode)
+                        # and scale stays 1.0 → wrong data. Dedupe per layer
+                        # (at most once) to avoid spamming during graph capture
+                        # while still showing the hint on real requests.
                         if layer.layer_name not in \
                                 FlashInferImpl._warned_uncalibrated_layers:
                             logger.warning(
@@ -1572,12 +1579,14 @@ class FlashInferImpl(AttentionImpl):
                             FlashInferImpl._warned_uncalibrated_layers.add(
                                 layer.layer_name
                             )
-                    # 反量化 (逐层临时分配, 层间串行执行自然释放; 实测峰值
-                    # 一层 ~700MB, 256K 场景验证过)。张量 scale 是 graph 输入,
-                    # 回放时读到校准后的值; 用 _k_scale_float (Python float)
-                    # 会被 CUDA graph 捕获折叠成常量 (启动时未校准 = 1.0) →
-                    # 数据错误。decode 分支走 Triton 内核时用 _kv_cache_int8
-                    # (原始 int8 + 张量 scale, 见 decode 分支)。
+                    # Dequantize (temporary allocation per layer; layers execute
+                    # serially so buffers are freed naturally; measured peak
+                    # ~700MB per layer at 256K context). Tensor scales are graph
+                    # inputs read back at replay; _k_scale_float (Python float)
+                    # would be folded to a constant at CUDA graph capture (1.0
+                    # while uncalibrated) → wrong data. The decode branch uses
+                    # _kv_cache_int8 (raw int8 + tensor scales, see the decode
+                    # branch) when taking the Triton kernel.
                     _k = kv_cache[:, 0].to(torch.float16) * layer._k_scale.to(
                         torch.float16
                     )
@@ -1869,14 +1878,17 @@ class FlashInferImpl(AttentionImpl):
                     if self.kv_cache_dtype == "int8_per_tensor" and (
                         _kv_cache_int8 is not None
                     ) and _use_triton_decode:
-                        # [FORK] int8 decode 走 Triton 内核: FlashInfer 0.6.8
-                        # 无 int8 decode 模板, 全池反量化 5.7 tok/s; Triton
-                        # unified_attention 原生 int8 (INT8_PER_TENSOR 分支),
-                        # 只处理请求块, 实测 42.8 tok/s。prefill 仍走 FlashInfer
-                        # (反量化路径, 1400+ tok/s)。用原始 int8 cache + 张量 scale。
-                        # 仅限每请求 1 token 的常规 decode (num_decode_tokens ==
-                        # num_decodes); 推测解码产生多 token 时回退 FlashInfer
-                        # 路径 (per-request metadata 语义不同, 见 #99 复审)。
+                        # [FORK] int8 decode goes through the Triton kernel:
+                        # FlashInfer 0.6.8 has no int8 decode template (whole-
+                        # pool dequant: 5.7 tok/s); Triton unified_attention
+                        # handles native int8 (INT8_PER_TENSOR branch), request
+                        # blocks only, measured 42.8 tok/s. Prefill stays on
+                        # FlashInfer (dequant path, 1400+ tok/s) using the raw
+                        # int8 cache + tensor scales. Only for regular 1-token
+                        # decode (num_decode_tokens == num_decodes); speculative
+                        # decode with multiple tokens falls back to the
+                        # FlashInfer path (per-request metadata semantics differ,
+                        # see review #99).
                         from vllm.v1.attention.ops.triton_unified_attention import (
                             unified_attention,
                         )
@@ -2026,8 +2038,8 @@ class FlashInferImpl(AttentionImpl):
             k_cache = kv_cache[:, 0]
             v_cache = kv_cache[:, 1]
             if self.kv_cache_dtype == "int8_per_tensor":
-                # [FORK] int8_per_tensor: C++ reshape_and_cache_flash 无 int8
-                # 分支, 改用 Triton 版 (与 TRITON_ATTN 后端同款, 支持 int8+scale)
+                # [FORK] int8_per_tensor: C++ reshape_and_cache_flash lacks an
+                # int8 branch; use the Triton version (same as TRITON_ATTN backend)
                 from vllm.v1.attention.ops.triton_reshape_and_cache_flash import (
                     triton_reshape_and_cache_flash,
                 )

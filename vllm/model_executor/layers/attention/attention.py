@@ -150,8 +150,8 @@ def _init_kv_cache_quant(
     # wrong scales) and then load real weights (which misses scales and keeps the
     # wrong scales from dummy load).
     set_default_quant_scales(layer, register_buffer=True)
-    # [FORK-PORT] PR#41505: int8_per_tensor 的对称量化范围是 ±127
-    # (fp8 默认用 envs K/V_SCALE_CONSTANT=200/100; int8 必须用 127)
+    # [FORK-PORT] PR#41505: int8_per_tensor uses a symmetric quantization
+    # range of ±127 (fp8 defaults to envs K/V_SCALE_CONSTANT=200/100; int8 must use 127)
     if getattr(layer, "kv_cache_dtype", None) == "int8_per_tensor":
         layer.k_range.fill_(127.0)
         layer.v_range.fill_(127.0)
@@ -506,9 +506,11 @@ class Attention(nn.Module, AttentionLayerBase):
         return output.view(-1, hidden_size)
 
     def calc_kv_scales(self, query, key, value):
-        # [FORK] int8_per_tensor: warmup/dummy 前向的 K/V 全零 → scale=0 垃圾缓存
-        # (hybrid #37554 实锤: 校准期 recurrent state 未初始化)。跳过零值校准,
-        # 保持 calculate_kv_scales 标志, 等第一个真实请求 (长 prefill) 再校准。
+        # [FORK] int8_per_tensor: warmup/dummy forward passes have all-zero K/V
+        # → scale=0 garbage cache (hybrid #37554 confirmed: recurrent state is
+        # uninitialized during calibration). Skip zero-value calibration and keep
+        # the calculate_kv_scales flag; calibrate on the first real request
+        # (long prefill) instead.
         if self.kv_cache_dtype == "int8_per_tensor":
             k_absmax = torch.abs(key).max().item()
             v_absmax = torch.abs(value).max().item()
@@ -525,7 +527,7 @@ class Attention(nn.Module, AttentionLayerBase):
         self._q_scale_float = self._q_scale.item()
         self._k_scale_float = self._k_scale.item()
         self._v_scale_float = self._v_scale.item()
-        # [FORK] int8_per_tensor 调试: 打印实际校准的 scale 值
+        # [FORK] int8_per_tensor debug: print the actually calibrated scale values
         if self.kv_cache_dtype == "int8_per_tensor":
             print(
                 f"[FORK-INT8SCALE] {self.layer_name} k_scale={self._k_scale_float:.6f} "
@@ -624,9 +626,11 @@ def maybe_calc_kv_scales(
     if not self.calculate_kv_scales:
         return
 
-    # [FORK] int8_per_tensor: CUDA graph 捕获/回放期间跳过 — calc_kv_scales 里有
-    # .item() CPU 同步, 在 capture 中触发 cudaErrorStreamCaptureInvalidated。
-    # 标志保留到第一个真实 eager prefill (长 chunk 超图捕获尺寸) 再校准。
+    # [FORK] int8_per_tensor: skip during CUDA graph capture/replay —
+    # calc_kv_scales contains .item() CPU sync, which triggers
+    # cudaErrorStreamCaptureInvalidated during capture. Keep the flag until the
+    # first real eager prefill (long chunk exceeding the graph capture size)
+    # calibrates.
     _cudagraph_mode = getattr(forward_context, "cudagraph_runtime_mode", None)
     if _cudagraph_mode is not None and _cudagraph_mode.name != "NONE":
         return

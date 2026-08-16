@@ -212,10 +212,12 @@ class HybridAttentionMambaModelConfig(VerifyAndUpdateConfig):
         # See issue: https://github.com/vllm-project/vllm/issues/37554
 
         if cache_config.calculate_kv_scales:
-            # [FORK-PORT] PR#41505: int8_per_tensor 保留动态 scale。
-            # fp8 对 hybrid 禁用是 issue #37554 (校准期 recurrent state 未初始化
-            # 会污染 fp8 scale); int8 路径同样受此影响, 但测试需要真实 scale,
-            # 校准请求用真实长文本 prefill 来规避。fp8 维持官方禁用行为。
+            # [FORK-PORT] PR#41505: keep dynamic scale for int8_per_tensor.
+            # fp8 is disabled for hybrid models per issue #37554 (uninitialized
+            # recurrent state during calibration pollutes the fp8 scale); the
+            # int8 path is equally affected, but tests need real scales, so the
+            # calibration request uses a real long-text prefill to avoid it.
+            # fp8 keeps the official disabled behavior.
             if cache_config.cache_dtype == "int8_per_tensor":
                 logger.info(
                     "Keeping calculate_kv_scales for int8_per_tensor KV on "

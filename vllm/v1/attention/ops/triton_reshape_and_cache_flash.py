@@ -379,7 +379,7 @@ def triton_reshape_and_cache_flash(
     assert kv_cache_dtype == "auto" or is_quantized_kv_cache(kv_cache_dtype), (
         f"unsupported kv_cache_dtype (str), got {kv_cache_dtype}."
     )
-    # [FORK-PORT] PR#41505: int8_per_tensor 走 torch.int8, 不做 fp8 view
+    # [FORK-PORT] PR#41505: int8_per_tensor uses torch.int8 directly; no fp8 view
     is_int8_per_tensor = kv_cache_dtype == "int8_per_tensor"
     is_int8 = kv_cache_dtype.startswith("int8")
     if is_int8:

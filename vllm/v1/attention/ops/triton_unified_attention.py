@@ -146,7 +146,7 @@ def kernel_unified_attention(
     CHUNK_LOOKBACK: tl.constexpr = -1,
     CHUNK_SIZE: tl.constexpr = -1,
 ):
-    # [FORK-PORT] PR#41505: mode 5 (INT8 per-tensor) 不是 per-token-head
+    # [FORK-PORT] PR#41505: mode 5 (INT8 per-tensor) is not per-token-head
     USE_PER_TOKEN_HEAD_SCALES: tl.constexpr = (KV_QUANT_MODE == 2) or (
         KV_QUANT_MODE == 3
     )
