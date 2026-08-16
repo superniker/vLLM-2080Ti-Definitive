@@ -1536,6 +1536,8 @@ class FlashInferImpl(AttentionImpl):
         if self.kv_sharing_target_layer_name is None and is_quantized_kv_cache(
             self.kv_cache_dtype
         ):
+            # [FORK] decode 是否走 Triton 快速路径 (int8 且每请求 1 token 无 padding)
+            _use_triton_decode = False
             if self.kv_cache_dtype == "int8_per_tensor":
                 # [FORK] int8_per_tensor: FlashInfer 内核无 int8 分支 (0.6.8
                 # 枚举有但模板无, 直接喂会 illegal address)。prefill 反量化成
@@ -1545,8 +1547,15 @@ class FlashInferImpl(AttentionImpl):
                 # 注意: 必须用张量 _k_scale/_v_scale (graph 输入, 回放时读到
                 # 校准后的值); 用 _k_scale_float (Python float) 会被 CUDA graph
                 # 捕获时折叠成常量 (启动时未校准 = 1.0) → 回放时数据错误。
+                # [FORK] 仅当 decode 为"每请求 1 token 且无 padding rows"
+                # (num_decode_tokens == num_decodes) 时走 Triton 快速路径;
+                # 推测解码或多 token 时回退 FlashInfer, 此时必须反量化
+                # (decode-only 回退也反量化, 否则 int8 cache 喂 FlashInfer 崩)。
+                _use_triton_decode = (
+                    attn_metadata.num_decode_tokens == attn_metadata.num_decodes
+                )
                 _kv_cache_int8 = kv_cache
-                if attn_metadata.num_prefill_tokens > 0:
+                if attn_metadata.num_prefill_tokens > 0 or not _use_triton_decode:
                     if layer._k_scale_float == 1.0:
                         # [FORK] 首个请求为短请求 (<2048 tokens, 全走 CUDA
                         # graph) 时校准被跳过 (calc_kv_scales 零值跳过 + graph
@@ -1859,7 +1868,7 @@ class FlashInferImpl(AttentionImpl):
                 else:
                     if self.kv_cache_dtype == "int8_per_tensor" and (
                         _kv_cache_int8 is not None
-                    ) and num_decode_tokens == attn_metadata.num_decodes:
+                    ) and _use_triton_decode:
                         # [FORK] int8 decode 走 Triton 内核: FlashInfer 0.6.8
                         # 无 int8 decode 模板, 全池反量化 5.7 tok/s; Triton
                         # unified_attention 原生 int8 (INT8_PER_TENSOR 分支),
