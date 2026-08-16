@@ -1292,6 +1292,9 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
 class FlashInferImpl(AttentionImpl):
     can_return_lse_for_decode: bool = True
 
+    # [FORK] int8_per_tensor 未校准警告去重标志
+    _warned_uncalibrated = False
+
     def __init__(
         self,
         num_heads: int,
@@ -1501,6 +1504,21 @@ class FlashInferImpl(AttentionImpl):
                 # 注意: 必须用张量 _k_scale/_v_scale (graph 输入, 回放时读到
                 # 校准后的值); 用 _k_scale_float (Python float) 会被 CUDA graph
                 # 捕获时折叠成常量 (启动时未校准 = 1.0) → 回放时数据错误。
+                if layer._k_scale_float == 1.0:
+                    # [FORK] 首个请求为短请求 (<2048 tokens, 全走 CUDA graph)
+                    # 时校准被跳过 (calc_kv_scales 零值跳过 + graph 模式 return),
+                    # scale 保持 1.0 → 数据错误。每层只提示一次。
+                    if not FlashInferImpl._warned_uncalibrated:
+                        logger.warning(
+                            "[FORK-INT8] int8 KV 未校准 (scale=1.0), 首个请求请用 "
+                            ">=2048 tokens 的长 prompt 触发校准 (layer=%s)",
+                            layer.layer_name,
+                        )
+                        FlashInferImpl._warned_uncalibrated = True
+                # 反量化 (逐层临时分配, 层间串行执行自然释放; 实测峰值一层
+                # ~700MB, 256K 场景验证过)。张量 scale 是 graph 输入, 回放时
+                # 读到校准后的值; 用 _k_scale_float (Python float) 会被 CUDA
+                # graph 捕获折叠成常量 (启动时未校准 = 1.0) → 数据错误。
                 _k = kv_cache[:, 0].to(torch.float16) * layer._k_scale.to(
                     torch.float16
                 )

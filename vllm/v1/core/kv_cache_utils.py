@@ -1176,7 +1176,7 @@ def _get_kv_cache_groups_uniform_page_size(
         for i in range(num_groups):
             grouped_layers.append(layers[i::num_groups])
     for _gl in grouped_layers:
-        print(f"[KVGROUP] layers={_gl}", flush=True)
+        logger.debug("kv cache group layers: %s", _gl)
     return create_kv_cache_group_specs(kv_cache_spec, grouped_layers)
 
 

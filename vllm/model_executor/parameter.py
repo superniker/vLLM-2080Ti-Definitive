@@ -197,14 +197,6 @@ class _ColumnvLLMParameter(BasevLLMParameter):
             self.output_dim, shard_id_int * shard_size, shard_size
         )
 
-        if param_data.shape != loaded_weight.shape:  # 临时探针
-            print(
-                f"[DBG-QKV] shard={shard_id} param_data={tuple(param_data.shape)} "
-                f"loaded={tuple(loaded_weight.shape)} full={tuple(self.data.shape)} "
-                f"off={shard_offset} sz={shard_size} tp={self.tp_rank} id={shard_id_int}",
-                flush=True,
-            )
-
         assert param_data.shape == loaded_weight.shape
         param_data.copy_(loaded_weight)
 
