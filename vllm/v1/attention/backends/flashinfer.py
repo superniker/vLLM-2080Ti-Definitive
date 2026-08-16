@@ -1292,8 +1292,8 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
 class FlashInferImpl(AttentionImpl):
     can_return_lse_for_decode: bool = True
 
-    # [FORK] int8_per_tensor 未校准警告去重标志
-    _warned_uncalibrated = False
+    # [FORK] int8_per_tensor 未校准警告去重 (按层记录, 每层最多一次)
+    _warned_uncalibrated_layers: set = set()
 
     def __init__(
         self,
@@ -1507,14 +1507,18 @@ class FlashInferImpl(AttentionImpl):
                 if layer._k_scale_float == 1.0:
                     # [FORK] 首个请求为短请求 (<2048 tokens, 全走 CUDA graph)
                     # 时校准被跳过 (calc_kv_scales 零值跳过 + graph 模式 return),
-                    # scale 保持 1.0 → 数据错误。每层只提示一次。
-                    if not FlashInferImpl._warned_uncalibrated:
+                    # scale 保持 1.0 → 数据错误。按层去重 (每层最多一次),
+                    # 避免 graph 捕获阶段刷屏且真实请求时仍能看到提示。
+                    if layer.layer_name not in \
+                            FlashInferImpl._warned_uncalibrated_layers:
                         logger.warning(
-                            "[FORK-INT8] int8 KV 未校准 (scale=1.0), 首个请求请用 "
-                            ">=2048 tokens 的长 prompt 触发校准 (layer=%s)",
+                            "[FORK-INT8] %s int8 KV 未校准 (scale=1.0), "
+                            "首个请求请用 >=2048 tokens 的长 prompt 触发校准",
                             layer.layer_name,
                         )
-                        FlashInferImpl._warned_uncalibrated = True
+                        FlashInferImpl._warned_uncalibrated_layers.add(
+                            layer.layer_name
+                        )
                 # 反量化 (逐层临时分配, 层间串行执行自然释放; 实测峰值一层
                 # ~700MB, 256K 场景验证过)。张量 scale 是 graph 输入, 回放时
                 # 读到校准后的值; 用 _k_scale_float (Python float) 会被 CUDA
