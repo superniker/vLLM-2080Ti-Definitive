@@ -1277,6 +1277,12 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                     disable_split_kv=self.disable_split_kv,
                 )
                 attn_metadata.decode = FIDecode(wrapper=decode_wrapper)
+        # [FORK] int8_per_tensor decode 走 Triton 内核用 (FlashInfer 0.6.8
+        # 无 int8 decode 模板;全池反量化 5.7 tok/s vs Triton 42.8 tok/s)。
+        # 动态属性而非 dataclass 字段: _copy_tensor_tree 遍历 dataclass 字段
+        # 并 copy_, 视图与底层 buffer 同内存会触发 graph 捕获崩溃。
+        attn_metadata.seq_lens = seq_lens
+        attn_metadata.block_table = block_table_tensor
         return attn_metadata
 
     def use_cascade_attention(self, *args, **kwargs) -> bool:
@@ -1359,6 +1365,39 @@ class FlashInferImpl(AttentionImpl):
         self.bmm1_scale: float | None = None
         self.bmm2_scale: float | None = None
         self.o_sf_scale: float | None = None
+
+        # [FORK] int8 decode 走 Triton unified_attention 的 3D 分段参数
+        # (同 triton_attn.py): 长上下文 decode 用 3D 分段并行 softmax,
+        # 否则 2D 单段串行扫全部 KV → 32K 语境 decode 3.4 tok/s vs 26。
+        self._decode_3d: dict | None = None
+        if kv_cache_dtype == "int8_per_tensor":
+            MIN_LAUNCH_GRID_SIZE_2D = 128
+            NUM_PAR_SOFTMAX_SEGMENTS = 16
+            seq_threshold = MIN_LAUNCH_GRID_SIZE_2D // num_kv_heads
+            if vllm_config is not None:
+                capture_sizes = (
+                    vllm_config.compilation_config.cudagraph_capture_sizes
+                )
+                if capture_sizes:
+                    seq_threshold = min(
+                        capture_sizes,
+                        key=lambda x: abs(x - seq_threshold),
+                    )
+            headdim_padded = head_size  # 128 已是 2 的幂
+            self._decode_3d = {
+                "seq_threshold_3D": seq_threshold,
+                "num_par_softmax_segments": NUM_PAR_SOFTMAX_SEGMENTS,
+                "softmax_segm_output": torch.empty(
+                    (seq_threshold, num_heads, NUM_PAR_SOFTMAX_SEGMENTS,
+                     headdim_padded),
+                    dtype=torch.float32, device="cuda"),
+                "softmax_segm_max": torch.empty(
+                    (seq_threshold, num_heads, NUM_PAR_SOFTMAX_SEGMENTS),
+                    dtype=torch.float32, device="cuda"),
+                "softmax_segm_expsum": torch.empty(
+                    (seq_threshold, num_heads, NUM_PAR_SOFTMAX_SEGMENTS),
+                    dtype=torch.float32, device="cuda"),
+            }
 
         # Pre-allocated FP8 output buffer for NVFP4 without fused output quant.
         if self.is_kvcache_nvfp4 and vllm_config is not None:
@@ -1499,37 +1538,44 @@ class FlashInferImpl(AttentionImpl):
         ):
             if self.kv_cache_dtype == "int8_per_tensor":
                 # [FORK] int8_per_tensor: FlashInfer 内核无 int8 分支 (0.6.8
-                # 枚举有但模板无, 直接喂会 illegal address)。反量化成 fp16
-                # 临时 buffer (K/V 各自 scale), 存储仍为 int8 减半。
+                # 枚举有但模板无, 直接喂会 illegal address)。prefill 反量化成
+                # fp16 临时 buffer (K/V 各自 scale), 存储仍为 int8 减半;
+                # decode 走 Triton 内核 (原生 int8) 用原始 cache, 不反量化
+                # (decode-only 每步省全池反量化 ~17GB 流量, 5.7 → 42 tok/s)。
                 # 注意: 必须用张量 _k_scale/_v_scale (graph 输入, 回放时读到
                 # 校准后的值); 用 _k_scale_float (Python float) 会被 CUDA graph
                 # 捕获时折叠成常量 (启动时未校准 = 1.0) → 回放时数据错误。
-                if layer._k_scale_float == 1.0:
-                    # [FORK] 首个请求为短请求 (<2048 tokens, 全走 CUDA graph)
-                    # 时校准被跳过 (calc_kv_scales 零值跳过 + graph 模式 return),
-                    # scale 保持 1.0 → 数据错误。按层去重 (每层最多一次),
-                    # 避免 graph 捕获阶段刷屏且真实请求时仍能看到提示。
-                    if layer.layer_name not in \
-                            FlashInferImpl._warned_uncalibrated_layers:
-                        logger.warning(
-                            "[FORK-INT8] %s int8 KV 未校准 (scale=1.0), "
-                            "首个请求请用 >=2048 tokens 的长 prompt 触发校准",
-                            layer.layer_name,
-                        )
-                        FlashInferImpl._warned_uncalibrated_layers.add(
-                            layer.layer_name
-                        )
-                # 反量化 (逐层临时分配, 层间串行执行自然释放; 实测峰值一层
-                # ~700MB, 256K 场景验证过)。张量 scale 是 graph 输入, 回放时
-                # 读到校准后的值; 用 _k_scale_float (Python float) 会被 CUDA
-                # graph 捕获折叠成常量 (启动时未校准 = 1.0) → 数据错误。
-                _k = kv_cache[:, 0].to(torch.float16) * layer._k_scale.to(
-                    torch.float16
-                )
-                _v = kv_cache[:, 1].to(torch.float16) * layer._v_scale.to(
-                    torch.float16
-                )
-                kv_cache = torch.stack((_k, _v), dim=1)
+                _kv_cache_int8 = kv_cache
+                if attn_metadata.num_prefill_tokens > 0:
+                    if layer._k_scale_float == 1.0:
+                        # [FORK] 首个请求为短请求 (<2048 tokens, 全走 CUDA
+                        # graph) 时校准被跳过 (calc_kv_scales 零值跳过 + graph
+                        # 模式 return), scale 保持 1.0 → 数据错误。按层去重
+                        # (每层最多一次), 避免 graph 捕获阶段刷屏且真实请求
+                        # 时仍能看到提示。
+                        if layer.layer_name not in \
+                                FlashInferImpl._warned_uncalibrated_layers:
+                            logger.warning(
+                                "[FORK-INT8] %s int8 KV 未校准 (scale=1.0), "
+                                "首个请求请用 >=2048 tokens 的长 prompt 触发校准",
+                                layer.layer_name,
+                            )
+                            FlashInferImpl._warned_uncalibrated_layers.add(
+                                layer.layer_name
+                            )
+                    # 反量化 (逐层临时分配, 层间串行执行自然释放; 实测峰值
+                    # 一层 ~700MB, 256K 场景验证过)。张量 scale 是 graph 输入,
+                    # 回放时读到校准后的值; 用 _k_scale_float (Python float)
+                    # 会被 CUDA graph 捕获折叠成常量 (启动时未校准 = 1.0) →
+                    # 数据错误。decode 分支走 Triton 内核时用 _kv_cache_int8
+                    # (原始 int8 + 张量 scale, 见 decode 分支)。
+                    _k = kv_cache[:, 0].to(torch.float16) * layer._k_scale.to(
+                        torch.float16
+                    )
+                    _v = kv_cache[:, 1].to(torch.float16) * layer._v_scale.to(
+                        torch.float16
+                    )
+                    kv_cache = torch.stack((_k, _v), dim=1)
             else:
                 torch_dtype = FlashInferBackend.get_dtype_for_flashinfer(
                     self.kv_cache_dtype
@@ -1811,14 +1857,71 @@ class FlashInferImpl(AttentionImpl):
                         get_dcp_group(),
                     )
                 else:
-                    decode_wrapper.run(
-                        decode_query,
-                        kv_cache_permute,
-                        k_scale=_kv_scale[0],
-                        v_scale=_kv_scale[1],
-                        out=out_decode,
-                        kv_cache_sf=kv_cache_sf,
-                    )
+                    if self.kv_cache_dtype == "int8_per_tensor" and (
+                        _kv_cache_int8 is not None
+                    ):
+                        # [FORK] int8 decode 走 Triton 内核: FlashInfer 0.6.8
+                        # 无 int8 decode 模板, 全池反量化 5.7 tok/s; Triton
+                        # unified_attention 原生 int8 (INT8_PER_TENSOR 分支),
+                        # 只处理请求块, 实测 42.8 tok/s。prefill 仍走 FlashInfer
+                        # (反量化路径, 1400+ tok/s)。用原始 int8 cache + 张量 scale。
+                        import os
+                        if os.environ.get("VLLM_INT8_DECODE_TRITON_DEBUG"):
+                            print(
+                                f"[FORK-DBG] decode Triton 路径: dtype="
+                                f"{self.kv_cache_dtype} n={num_decode_tokens}",
+                                flush=True,
+                            )
+                        from vllm.v1.attention.ops.triton_unified_attention import (
+                            unified_attention,
+                        )
+                        from vllm.v1.kv_cache_interface import KVQuantMode
+
+                        num_seqs = num_decode_tokens
+                        key_cache_i8, value_cache_i8 = _kv_cache_int8.unbind(1)
+                        seqused_k = attn_metadata.seq_lens[:num_seqs]
+                        cu_seqlens_q = torch.arange(
+                            num_seqs + 1,
+                            device=decode_query.device,
+                            dtype=torch.int32,
+                        )
+                        descale_shape = (num_seqs, key_cache_i8.shape[2])
+                        d3 = self._decode_3d or {}
+                        unified_attention(
+                            q=decode_query,
+                            k=key_cache_i8,
+                            v=value_cache_i8,
+                            out=out_decode,
+                            cu_seqlens_q=cu_seqlens_q,
+                            max_seqlen_q=1,
+                            seqused_k=seqused_k,
+                            max_seqlen_k=seqused_k.max(),
+                            softmax_scale=self.scale,
+                            causal=True,
+                            window_size=self.sliding_window,
+                            block_table=attn_metadata.block_table[:num_seqs],
+                            softcap=self.logits_soft_cap or 0.0,
+                            q_descale=None,
+                            k_descale=layer._k_scale.expand(descale_shape),
+                            v_descale=layer._v_scale.expand(descale_shape),
+                            seq_threshold_3D=d3.get("seq_threshold_3D"),
+                            num_par_softmax_segments=d3.get(
+                                "num_par_softmax_segments"
+                            ),
+                            softmax_segm_output=d3.get("softmax_segm_output"),
+                            softmax_segm_max=d3.get("softmax_segm_max"),
+                            softmax_segm_expsum=d3.get("softmax_segm_expsum"),
+                            kv_quant_mode=KVQuantMode.INT8_PER_TENSOR,
+                        )
+                    else:
+                        decode_wrapper.run(
+                            decode_query,
+                            kv_cache_permute,
+                            k_scale=_kv_scale[0],
+                            v_scale=_kv_scale[1],
+                            out=out_decode,
+                            kv_cache_sf=kv_cache_sf,
+                        )
 
                 if needs_fp8_out:
                     output[:num_decode_tokens].copy_(out_decode.to(output.dtype))
