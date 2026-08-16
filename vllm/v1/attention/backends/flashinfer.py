@@ -292,11 +292,12 @@ class BatchDCPPrefillWrapper:
         prefill_query_across_dcp = get_dcp_group().all_gather(
             prefill_query.contiguous(), dim=1
         )
+        _is_i8 = getattr(layer, "kv_cache_dtype", "") == "int8_per_tensor"
         output_context_tmp, lse_context_tmp = self._context.run(
             prefill_query_across_dcp,
             kv_cache_permute,
-            k_scale=layer._k_scale_float,
-            v_scale=layer._v_scale_float,
+            k_scale=(1.0 if _is_i8 else layer._k_scale_float),
+            v_scale=(1.0 if _is_i8 else layer._v_scale_float),
             return_lse=True,
         )
         output_context, lse_context = self._dcp_combine(
@@ -335,6 +336,9 @@ class FlashInferBackend(AttentionBackend):
         "fp8_e4m3",
         "fp8_e5m2",
         "nvfp4",
+        # [FORK] int8_per_tensor: FlashInfer 内核无 int8 分支, 在 forward 里
+        # 反量化成 fp16 临时 buffer 再喂内核 (KV 存储仍减半, 反量化开销 ~带宽)
+        "int8_per_tensor",
     ]
 
     @staticmethod
@@ -627,7 +631,12 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
             # Cannot use self.kv_cache_spec.dtype here because kv_cache_spec
             # storage dtype may not be the same as the op dtype (uint8 vs fp8_e4m3)
             self.is_kvcache_nvfp4 = self.cache_dtype == "nvfp4"
-            if self.is_kvcache_nvfp4:
+            if self.cache_dtype == "int8_per_tensor":
+                # [FORK] int8_per_tensor: FlashInfer 0.6.8 内核无 int8 分支,
+                # forward 里反量化成 fp16 临时 buffer 再喂内核; 这里告知
+                # FlashInfer 数据是 fp16 (plan 的 kv_data_type)。
+                self.kv_cache_dtype = torch.float16
+            elif self.is_kvcache_nvfp4:
                 # For NVFP4, kv_cache_dtype stays as the string "nvfp4"
                 # which is passed to FlashInferImpl
                 self.kv_cache_dtype = self.cache_dtype
@@ -1416,14 +1425,20 @@ class FlashInferImpl(AttentionImpl):
             f"got {query.dtype}"
         )
 
+        # [FORK] int8_per_tensor 走反量化路径 (数据已含 scale), 不折叠进 bmm
+        _is_int8_dequant = self.kv_cache_dtype == "int8_per_tensor"
+        # [FORK] int8_per_tensor: KV 已反量化为 fp16 真实值, 不能再传
+        # k_scale/v_scale 给 FlashInfer (否则双重 scale 导致乱码)
+        _kv_scale = (1.0, 1.0) if _is_int8_dequant else (
+            layer._k_scale_float, layer._v_scale_float)
         if self.bmm1_scale is None:
             self.bmm1_scale = self.scale
-            if is_quantized_kv_cache(self.kv_cache_dtype):
+            if is_quantized_kv_cache(self.kv_cache_dtype) and not _is_int8_dequant:
                 self.bmm1_scale *= layer._q_scale_float * layer._k_scale_float
 
         if self.bmm2_scale is None:
             self.bmm2_scale = 1.0
-            if is_quantized_kv_cache(self.kv_cache_dtype):
+            if is_quantized_kv_cache(self.kv_cache_dtype) and not _is_int8_dequant:
                 self.bmm2_scale *= layer._v_scale_float
 
         prefill_use_trtllm = isinstance(attn_metadata.prefill, TRTLLMPrefill)
@@ -1479,10 +1494,25 @@ class FlashInferImpl(AttentionImpl):
         if self.kv_sharing_target_layer_name is None and is_quantized_kv_cache(
             self.kv_cache_dtype
         ):
-            torch_dtype = FlashInferBackend.get_dtype_for_flashinfer(
-                self.kv_cache_dtype
-            )
-            kv_cache = kv_cache.view(torch_dtype)
+            if self.kv_cache_dtype == "int8_per_tensor":
+                # [FORK] int8_per_tensor: FlashInfer 内核无 int8 分支 (0.6.8
+                # 枚举有但模板无, 直接喂会 illegal address)。反量化成 fp16
+                # 临时 buffer (K/V 各自 scale), 存储仍为 int8 减半。
+                # 注意: 必须用张量 _k_scale/_v_scale (graph 输入, 回放时读到
+                # 校准后的值); 用 _k_scale_float (Python float) 会被 CUDA graph
+                # 捕获时折叠成常量 (启动时未校准 = 1.0) → 回放时数据错误。
+                _k = kv_cache[:, 0].to(torch.float16) * layer._k_scale.to(
+                    torch.float16
+                )
+                _v = kv_cache[:, 1].to(torch.float16) * layer._v_scale.to(
+                    torch.float16
+                )
+                kv_cache = torch.stack((_k, _v), dim=1)
+            else:
+                torch_dtype = FlashInferBackend.get_dtype_for_flashinfer(
+                    self.kv_cache_dtype
+                )
+                kv_cache = kv_cache.view(torch_dtype)
 
         # Inputs and outputs may be padded for CUDA graphs
         query = query[:num_actual_tokens]
@@ -1595,8 +1625,8 @@ class FlashInferImpl(AttentionImpl):
                     prefill_wrapper.run(
                         prefill_query,
                         kv_cache_permute,
-                        k_scale=layer._k_scale_float,
-                        v_scale=layer._v_scale_float,
+                        k_scale=_kv_scale[0],
+                        v_scale=_kv_scale[1],
                         out=out_prefill,
                         kv_cache_sf=kv_cache_sf,
                     )
@@ -1746,8 +1776,8 @@ class FlashInferImpl(AttentionImpl):
                     decode_wrapper.run(
                         decode_query,
                         kv_cache_permute,
-                        k_scale=layer._k_scale_float,
-                        v_scale=layer._v_scale_float,
+                        k_scale=_kv_scale[0],
+                        v_scale=_kv_scale[1],
                         out=output_tmp,
                         lse=lse,
                         return_lse=True,
@@ -1762,8 +1792,8 @@ class FlashInferImpl(AttentionImpl):
                     decode_wrapper.run(
                         decode_query,
                         kv_cache_permute,
-                        k_scale=layer._k_scale_float,
-                        v_scale=layer._v_scale_float,
+                        k_scale=_kv_scale[0],
+                        v_scale=_kv_scale[1],
                         out=out_decode,
                         kv_cache_sf=kv_cache_sf,
                     )
@@ -1865,16 +1895,33 @@ class FlashInferImpl(AttentionImpl):
             # actual tokens.
             k_cache = kv_cache[:, 0]
             v_cache = kv_cache[:, 1]
-            torch.ops._C_cache_ops.reshape_and_cache_flash(
-                key,
-                value,
-                k_cache,
-                v_cache,
-                slot_mapping,
-                self.kv_cache_dtype,
-                layer._k_scale,
-                layer._v_scale,
-            )
+            if self.kv_cache_dtype == "int8_per_tensor":
+                # [FORK] int8_per_tensor: C++ reshape_and_cache_flash 无 int8
+                # 分支, 改用 Triton 版 (与 TRITON_ATTN 后端同款, 支持 int8+scale)
+                from vllm.v1.attention.ops.triton_reshape_and_cache_flash import (
+                    triton_reshape_and_cache_flash,
+                )
+                triton_reshape_and_cache_flash(
+                    key,
+                    value,
+                    k_cache,
+                    v_cache,
+                    slot_mapping,
+                    self.kv_cache_dtype,
+                    layer._k_scale,
+                    layer._v_scale,
+                )
+            else:
+                torch.ops._C_cache_ops.reshape_and_cache_flash(
+                    key,
+                    value,
+                    k_cache,
+                    v_cache,
+                    slot_mapping,
+                    self.kv_cache_dtype,
+                    layer._k_scale,
+                    layer._v_scale,
+                )
 
 
 def fast_plan_decode(
