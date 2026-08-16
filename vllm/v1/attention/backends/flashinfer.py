@@ -1859,19 +1859,15 @@ class FlashInferImpl(AttentionImpl):
                 else:
                     if self.kv_cache_dtype == "int8_per_tensor" and (
                         _kv_cache_int8 is not None
-                    ):
+                    ) and num_decode_tokens == attn_metadata.num_decodes:
                         # [FORK] int8 decode 走 Triton 内核: FlashInfer 0.6.8
                         # 无 int8 decode 模板, 全池反量化 5.7 tok/s; Triton
                         # unified_attention 原生 int8 (INT8_PER_TENSOR 分支),
                         # 只处理请求块, 实测 42.8 tok/s。prefill 仍走 FlashInfer
                         # (反量化路径, 1400+ tok/s)。用原始 int8 cache + 张量 scale。
-                        import os
-                        if os.environ.get("VLLM_INT8_DECODE_TRITON_DEBUG"):
-                            print(
-                                f"[FORK-DBG] decode Triton 路径: dtype="
-                                f"{self.kv_cache_dtype} n={num_decode_tokens}",
-                                flush=True,
-                            )
+                        # 仅限每请求 1 token 的常规 decode (num_decode_tokens ==
+                        # num_decodes); 推测解码产生多 token 时回退 FlashInfer
+                        # 路径 (per-request metadata 语义不同, 见 #99 复审)。
                         from vllm.v1.attention.ops.triton_unified_attention import (
                             unified_attention,
                         )
