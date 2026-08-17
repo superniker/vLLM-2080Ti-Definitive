@@ -56,6 +56,7 @@ from vllm.model_executor.layers.mamba.ops.causal_conv1d import (
     causal_conv1d_update,
 )
 from vllm.model_executor.layers.quantization import QuantizationConfig
+from vllm.model_executor.layers.quantization.utils.fp8_utils import is_fp8
 from vllm.model_executor.model_loader.weight_utils import (
     sharded_weight_loader,
 )
@@ -909,12 +910,12 @@ class GatedDeltaNetAttention(PluggableLayer, MambaBase):
             # Fp8LinearMethod.apply expects fp16/bf16 activations and dequant
             # the weight internally (review #107 round 7 P1).
             _w = getattr(self.out_proj, "weight", None)
-            if _w is not None and _w.dtype in (torch.float8_e4m3fn,
-                                               torch.float8_e5m2):
+            if _w is not None and is_fp8(_w.dtype):
                 # FP8 storage dtype: keep activations in a non-FP8 compute
                 # dtype (the FP8 kernel quantizes internally). Prefer the
                 # activation's own dtype so bf16 models are not downcast to
-                # fp16 (review #107 round 7 P1).
+                # fp16 (review #107 round 7 P1). is_fp8 covers e4m3fn and
+                # e4m3fnuz (ROCm) (review #107 round 8 P1).
                 if proj_in.dtype not in (torch.float16, torch.bfloat16):
                     proj_in = proj_in.to(torch.float16)
             elif _w is not None:
