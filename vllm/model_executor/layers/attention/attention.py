@@ -678,6 +678,10 @@ def maybe_calc_kv_scales(
         elif isinstance(_md, list) and _md:
             _md = _md[0].get(layer_name)
         _seq_lens_cpu = getattr(getattr(_md, "prefill", None), "seq_lens_cpu", None)
+        if _seq_lens_cpu is None:
+            # Triton attention backend stores seq_lens_cpu on the metadata
+            # object itself rather than under .prefill (review #106).
+            _seq_lens_cpu = getattr(_md, "seq_lens_cpu", None)
         _max_seq_len = 0
         if _seq_lens_cpu is not None and _seq_lens_cpu.numel() > 0:
             _max_seq_len = int(_seq_lens_cpu.max().item())
