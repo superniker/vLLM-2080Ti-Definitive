@@ -672,6 +672,18 @@ def maybe_calc_kv_scales(
                                 None)
         if _seq_lens_cpu is None:
             _seq_lens_cpu = getattr(_md, "seq_lens_cpu", None)
+            if _seq_lens_cpu is not None:
+                # TritonAttentionMetadata: seq_lens_cpu mixes prefill and
+                # decode rows. A pure decode batch must NOT qualify — its
+                # seq_lens_cpu rows carry the full context length (>=2K for
+                # long conversations), so the gate would pass and calibrate
+                # from single-token decode K/V, missing the prompt
+                # distribution (review #109 round 8 P1). Detect it via
+                # num_actual_tokens == num_seqs (one token per request) and
+                # defer to the next prefill batch.
+                _num_tok = getattr(_md, "num_actual_tokens", None)
+                if _num_tok is not None and _num_tok == _seq_lens_cpu.numel():
+                    _seq_lens_cpu = None
         if _seq_lens_cpu is None:
             # FlashInfer TRTLLM prefill has no seq_lens_cpu (seq lengths stay
             # on GPU only); TRTLLMPrefill.seq_lens covers prefill requests
