@@ -369,13 +369,11 @@ class GGUFModelLoader(BaseModelLoader):
             """
             # In transformers v5, multimodal models (e.g. Gemma3) wrap
             # all sub-models under an outer 'model.' attribute, producing
-            # state_dict keys like 'model.language_model.layers.0...' and
-            # 'model.vision_tower.vision_model...'.  Strip this outer
-            # prefix so the keys match what gguf-py expects.
-            if is_multimodal and (
-                hf_name.startswith("model.language_model.")
-                or hf_name.startswith("model.vision_tower.")
-            ):
+            # state_dict keys like 'model.language_model.layers.0...',
+            # 'model.vision_tower.vision_model...' and
+            # 'model.multi_modal_projector...'.  Strip this outer prefix so
+            # the keys match what gguf-py expects.
+            if is_multimodal and hf_name.startswith("model."):
                 hf_name = hf_name[6:]  # Remove outer 'model.'
 
             # Strip 'language_model.' prefix for multimodal models - gguf-py

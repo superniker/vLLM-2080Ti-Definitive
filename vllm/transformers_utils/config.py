@@ -777,9 +777,18 @@ def get_config(
         if (
             config.model_type == "qwen35"
             and getattr(config, "vision_config", None) is not None
-            and not (detect_gguf_multimodal(str(model)) is not None)
         ):
-            config.vision_config = None
+            # Rebuild the original GGUF file path: get_config rewrote `model`
+            # into the parent directory and stashed the filename in
+            # kwargs["gguf_file"], so detect_gguf_multimodal must receive the
+            # actual file (it returns None for a directory). Remote GGUFs are
+            # resolved after download by GGUFModelLoader, so they keep the
+            # text-only default here.
+            _gguf_path = str(model)
+            if kwargs.get("gguf_file"):
+                _gguf_path = str(Path(model) / kwargs["gguf_file"])
+            if detect_gguf_multimodal(_gguf_path) is None:
+                config.vision_config = None
         # GGUF ssm structure -> vLLM GDN layout (Qwen3.5 family):
         # ssm_alpha/beta output 48 dims, ssm_out 6144 = 48*128, ssm_dt/a[48]
         # -> linear_num_value_heads must be 48 (default 32 would mismatch shape)
