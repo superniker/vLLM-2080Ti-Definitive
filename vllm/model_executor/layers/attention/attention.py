@@ -516,7 +516,7 @@ class Attention(nn.Module, AttentionLayerBase):
         if self.kv_cache_dtype == "int8_per_tensor":
             k_absmax = torch.abs(key).max().item()
             v_absmax = torch.abs(value).max().item()
-            if k_absmax == 0.0 or v_absmax == 0.0:
+            if k_absmax == 0.0 and v_absmax == 0.0:
                 logger.debug(
                     "[FORK-INT8SCALE] %s skip zero-value calibration "
                     "(k_absmax=%.6f v_absmax=%.6f), waiting for real request",
@@ -526,9 +526,13 @@ class Attention(nn.Module, AttentionLayerBase):
         self._q_scale.copy_(torch.abs(query).max() / self.q_range)
         if self.kv_cache_dtype == "int8_per_tensor":
             # Reuse the k_absmax/v_absmax computed above instead of re-running
-            # two full reductions (review #109 round 6).
-            self._k_scale.copy_(k_absmax / self.k_range)
-            self._v_scale.copy_(v_absmax / self.v_range)
+            # two full reductions (review #109 round 6). Calibrate each tensor
+            # independently: a zero K (or V) keeps its previous scale while
+            # the nonzero one is calibrated (review #106 round 7 P2).
+            if k_absmax > 0.0:
+                self._k_scale.copy_(k_absmax / self.k_range)
+            if v_absmax > 0.0:
+                self._v_scale.copy_(v_absmax / self.v_range)
         else:
             self._k_scale.copy_(torch.abs(key).max() / self.k_range)
             self._v_scale.copy_(torch.abs(value).max() / self.v_range)
@@ -641,15 +645,50 @@ def maybe_calc_kv_scales(
     # cudaErrorStreamCaptureInvalidated during capture. Keep the flag until the
     # first real eager prefill (long chunk exceeding the graph capture size)
     # calibrates. FULL CUDA-graph capture passes cudagraph_runtime_mode=NONE,
-    # so an active stream capture is also detected. Scoped to int8_per_tensor
-    # so other quantized KV dtypes (fp8 etc.) keep upstream first-forward
-    # calibration timing (review #109 round 6 P2).
-    _cudagraph_mode = getattr(forward_context, "cudagraph_runtime_mode", None)
-    _in_cudagraph = (
-        _cudagraph_mode is not None and _cudagraph_mode.name != "NONE"
-    ) or torch.cuda.is_current_stream_capturing()
-    if self.kv_cache_dtype == "int8_per_tensor" and _in_cudagraph:
-        return
+    # so an active stream capture is also detected. The mode check is scoped
+    # inside the int8 dtype guard so non-int8 paths evaluate no CUDA API and
+    # keep upstream first-forward calibration timing (review #109 round 7 P2).
+    if self.kv_cache_dtype == "int8_per_tensor":
+        _cudagraph_mode = getattr(forward_context, "cudagraph_runtime_mode", None)
+        _in_cudagraph = (
+            _cudagraph_mode is not None and _cudagraph_mode.name != "NONE"
+        ) or torch.cuda.is_current_stream_capturing()
+        if _in_cudagraph:
+            return
+        # [FORK] int8_per_tensor: gate calibration on a long prefill (>=2K
+        # tokens) so a warmup or short decode pass does not permanently lock
+        # scales calibrated from a tiny key/value batch (review #109 round 7
+        # P1). Read the backend's per-request total sequence lengths:
+        # FlashInfer FIPrefill.seq_lens_cpu / TRTLLMPrefill.seq_lens cover
+        # prefill requests only; TritonAttentionMetadata stores seq_lens_cpu
+        # on the metadata object (mixed rows). is_prefilling filtering lands
+        # with PR #106 (this branch predates it).
+        _md = getattr(forward_context, "attn_metadata", None)
+        if isinstance(_md, dict):
+            _md = _md.get(layer_name)
+        elif isinstance(_md, list) and _md:
+            _md = _md[0].get(layer_name)
+        _seq_lens_cpu = getattr(getattr(_md, "prefill", None), "seq_lens_cpu",
+                                None)
+        if _seq_lens_cpu is None:
+            _seq_lens_cpu = getattr(_md, "seq_lens_cpu", None)
+        if _seq_lens_cpu is None:
+            # FlashInfer TRTLLM prefill has no seq_lens_cpu (seq lengths stay
+            # on GPU only); TRTLLMPrefill.seq_lens covers prefill requests
+            # exclusively, which is exactly the population this gate wants.
+            _seq_lens_t = getattr(getattr(_md, "prefill", None), "seq_lens",
+                                  None)
+            if _seq_lens_t is not None and _seq_lens_t.numel() > 0:
+                _seq_lens_cpu = _seq_lens_t
+        _max_seq_len = 0
+        if _seq_lens_cpu is not None and _seq_lens_cpu.numel() > 0:
+            _max_seq_len = int(_seq_lens_cpu.max().item())
+        if _max_seq_len < 2048:
+            logger.debug(
+                "[FORK-INT8SCALE] %s defer calibration: max prefill seq "
+                "len=%d < 2048", layer_name, _max_seq_len,
+            )
+            return
 
     self.calc_kv_scales(query, key, value)
 
