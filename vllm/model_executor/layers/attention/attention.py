@@ -565,8 +565,16 @@ class Attention(nn.Module, AttentionLayerBase):
                 self.layer_name, self._k_scale_float, self._v_scale_float,
                 k_absmax, v_absmax,
             )
-        # We only calculate the scales once
-        self.calculate_kv_scales = False
+        # We only calculate the scales once. If one tensor was still zero
+        # (its scale left at the default), keep calibration pending so a
+        # later nonzero value is not clipped by a stale 1.0 scale; only
+        # finish when both K and V have nonzero maxima (review #106 round 8
+        # P1).
+        if (
+            self.kv_cache_dtype != "int8_per_tensor"
+            or (k_absmax > 0.0 and v_absmax > 0.0)
+        ):
+            self.calculate_kv_scales = False
 
     def extra_repr(self) -> str:
         s = f"head_size={self.impl.head_size}"  # type: ignore
