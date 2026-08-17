@@ -661,8 +661,10 @@ def maybe_calc_kv_scales(
         # P1). Read the backend's per-request total sequence lengths:
         # FlashInfer FIPrefill.seq_lens_cpu / TRTLLMPrefill.seq_lens cover
         # prefill requests only; TritonAttentionMetadata stores seq_lens_cpu
-        # on the metadata object (mixed rows). is_prefilling filtering lands
-        # with PR #106 (this branch predates it).
+        # on the metadata object (mixed rows), so restrict to prefill rows
+        # via is_prefilling below (review #109 round 8 P1/P2). The
+        # is_prefilling field mirrors PR #106; keeping it identical on both
+        # branches keeps them mergeable.
         _md = getattr(forward_context, "attn_metadata", None)
         if isinstance(_md, dict):
             _md = _md.get(layer_name)
@@ -678,12 +680,23 @@ def maybe_calc_kv_scales(
                 # seq_lens_cpu rows carry the full context length (>=2K for
                 # long conversations), so the gate would pass and calibrate
                 # from single-token decode K/V, missing the prompt
-                # distribution (review #109 round 8 P1). Detect it via
-                # num_actual_tokens == num_seqs (one token per request) and
-                # defer to the next prefill batch.
-                _num_tok = getattr(_md, "num_actual_tokens", None)
-                if _num_tok is not None and _num_tok == _seq_lens_cpu.numel():
-                    _seq_lens_cpu = None
+                # distribution (review #109 round 8 P1). Restrict to actual
+                # prefill rows via is_prefilling (computed < prompt length,
+                # gpu_model_runner.py:2216); a 1-token extend is still a
+                # prefill row and stays eligible (review #109 round 8 P2).
+                _is_prefilling = getattr(_md, "is_prefilling", None)
+                if _is_prefilling is not None and _is_prefilling.numel(
+                ) == _seq_lens_cpu.numel():
+                    _seq_lens_cpu = _seq_lens_cpu[_is_prefilling]
+                    if _seq_lens_cpu.numel() == 0:
+                        # No prefill rows at all (pure decode batch).
+                        _seq_lens_cpu = None
+                elif _is_prefilling is None:
+                    # Fallback: num_actual_tokens == num_seqs implies one
+                    # token per request, i.e. no multi-token prefill.
+                    _num_tok = getattr(_md, "num_actual_tokens", None)
+                    if _num_tok is not None and _num_tok == _seq_lens_cpu.numel():
+                        _seq_lens_cpu = None
         if _seq_lens_cpu is None:
             # FlashInfer TRTLLM prefill has no seq_lens_cpu (seq lengths stay
             # on GPU only); TRTLLMPrefill.seq_lens covers prefill requests

@@ -297,6 +297,7 @@ class TritonAttentionMetadata:
     block_table: torch.Tensor
     slot_mapping: torch.Tensor
     num_computed_tokens_cpu: torch.Tensor | None
+    is_prefilling: torch.Tensor | None
 
     seq_threshold_3D: int
     num_par_softmax_segments: int
@@ -489,6 +490,7 @@ class TritonAttentionMetadataBuilder(AttentionMetadataBuilder[TritonAttentionMet
             block_table=block_table_tensor,
             slot_mapping=slot_mapping,
             num_computed_tokens_cpu=num_computed_tokens_cpu,
+            is_prefilling=common_attn_metadata.is_prefilling,
             use_cascade=use_cascade,
             common_prefix_len=common_prefix_len,
             cu_prefix_query_lens=cu_prefix_query_lens,
