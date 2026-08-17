@@ -113,9 +113,18 @@ def set_default_quant_scales(layer: nn.Module, register_buffer: bool = False) ->
     layer._prob_scale_float = 1.0
 
     # Initialize q/k/v range constants used by calc_kv_scales
-    layer.q_range = torch.tensor(envs.Q_SCALE_CONSTANT, dtype=torch.float32)
-    layer.k_range = torch.tensor(envs.K_SCALE_CONSTANT, dtype=torch.float32)
-    layer.v_range = torch.tensor(envs.V_SCALE_CONSTANT, dtype=torch.float32)
+    if getattr(layer, "kv_cache_dtype", None) == "int8_per_tensor":
+        # [FORK-PORT] PR#41505: symmetric int8 quantization range is ±127,
+        # NOT the fp8 defaults (envs K/V_SCALE_CONSTANT = 200/100). Without
+        # this, process_weights_after_loading resets the ranges to 200/100
+        # before calibration and int8 K/V values clip (review #106 P1).
+        layer.q_range = torch.tensor(127.0, dtype=torch.float32)
+        layer.k_range = torch.tensor(127.0, dtype=torch.float32)
+        layer.v_range = torch.tensor(127.0, dtype=torch.float32)
+    else:
+        layer.q_range = torch.tensor(envs.Q_SCALE_CONSTANT, dtype=torch.float32)
+        layer.k_range = torch.tensor(envs.K_SCALE_CONSTANT, dtype=torch.float32)
+        layer.v_range = torch.tensor(envs.V_SCALE_CONSTANT, dtype=torch.float32)
 
 
 def _init_kv_cache_quant(
@@ -640,6 +649,20 @@ def maybe_calc_kv_scales(
     # calibrate.
     _cudagraph_mode = getattr(forward_context, "cudagraph_runtime_mode", None)
     if _cudagraph_mode is not None and _cudagraph_mode.name != "NONE":
+        return
+    # [FORK] FULL CUDA-graph capture passes cudagraph_runtime_mode=NONE, so the
+    # mode guard above is insufficient — detect an active stream capture instead
+    # (review #106 P1). torch.cuda.is_current_stream_capturing() is cheap and
+    # returns True only on the capturing stream.
+    if torch.cuda.is_current_stream_capturing():
+        return
+
+    # [FORK] int8_per_tensor: defer calibration until a real long prefill —
+    # a short first request (dummy/graph warmup) underestimates long-context
+    # ranges and clips later K/V values (review #106 P1, hybrid recurrent
+    # state garbage is nonzero so the zero-value check below cannot catch it).
+    # Keep calculate_kv_scales set so the next long request calibrates.
+    if query.shape[0] < 2048:
         return
 
     self.calc_kv_scales(query, key, value)
