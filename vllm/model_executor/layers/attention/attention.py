@@ -667,8 +667,20 @@ def maybe_calc_kv_scales(
     # calibration forever (review #106 P2). Other quantized KV dtypes (fp8
     # etc.) keep upstream first-forward calibration.
     if self.kv_cache_dtype == "int8_per_tensor":
+        # Resolve the per-layer metadata entry (mirror get_attention_context):
+        # forward_context.attn_metadata is dict[layer_name] or, for
+        # speculative decoding, list[dict[layer_name]]. Read the backend's
+        # actual per-request total sequence length (FIPrefill.seq_lens_cpu
+        # includes context, not just the current chunk).
         _md = getattr(forward_context, "attn_metadata", None)
-        _max_seq_len = getattr(getattr(_md, "prefill", None), "max_seq_len", 0)
+        if isinstance(_md, dict):
+            _md = _md.get(layer_name)
+        elif isinstance(_md, list) and _md:
+            _md = _md[0].get(layer_name)
+        _seq_lens_cpu = getattr(getattr(_md, "prefill", None), "seq_lens_cpu", None)
+        _max_seq_len = 0
+        if _seq_lens_cpu is not None and _seq_lens_cpu.numel() > 0:
+            _max_seq_len = int(_seq_lens_cpu.max().item())
         if _max_seq_len < 2048:
             return
 
