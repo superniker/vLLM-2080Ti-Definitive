@@ -150,9 +150,11 @@ def _init_kv_cache_quant(
     # wrong scales) and then load real weights (which misses scales and keeps the
     # wrong scales from dummy load).
     set_default_quant_scales(layer, register_buffer=True)
-    # [FORK-PORT] PR#41505: symmetric quantization range for int8_per_tensor is ±127
-    # (fp8 defaults to envs K/V_SCALE_CONSTANT=200/100; int8 must use 127)
     if getattr(layer, "kv_cache_dtype", None) == "int8_per_tensor":
+        # [FORK-PORT] PR#41505: symmetric quantization range for int8_per_tensor
+        # is +-127 (fp8 defaults to envs K/V_SCALE_CONSTANT=200/100; int8 must
+        # use 127). Enforced again after quant weight loading below in case a
+        # checkpoint ships fp8-style k/v_scale values.
         layer.k_range.fill_(127.0)
         layer.v_range.fill_(127.0)
 
@@ -177,6 +179,12 @@ def _init_kv_cache_quant(
         # values after weight loading.
         layer.quant_method = quant_method
         layer.quant_method.create_weights(layer)
+    if getattr(layer, "kv_cache_dtype", None) == "int8_per_tensor":
+        # [FORK-PORT] Re-assert the int8 symmetric range after quant weight
+        # loading: fp8-style checkpoints may carry k/v_scale weights that
+        # would otherwise overwrite the 127 range set above.
+        layer.k_range.fill_(127.0)
+        layer.v_range.fill_(127.0)
 
 
 class Attention(nn.Module, AttentionLayerBase):
@@ -515,10 +523,10 @@ class Attention(nn.Module, AttentionLayerBase):
             k_absmax = torch.abs(key).max().item()
             v_absmax = torch.abs(value).max().item()
             if k_absmax == 0.0 or v_absmax == 0.0:
-                print(
-                    f"[FORK-INT8SCALE] {self.layer_name} 跳过零值校准 "
-                    f"(k_absmax={k_absmax:.6f} v_absmax={v_absmax:.6f}), 等真实请求",
-                    flush=True,
+                logger.debug(
+                    "[FORK-INT8SCALE] %s skip zero-value calibration "
+                    "(k_absmax=%.6f v_absmax=%.6f), waiting for real request",
+                    self.layer_name, k_absmax, v_absmax,
                 )
                 return
         self._q_scale.copy_(torch.abs(query).max() / self.q_range)
@@ -527,14 +535,13 @@ class Attention(nn.Module, AttentionLayerBase):
         self._q_scale_float = self._q_scale.item()
         self._k_scale_float = self._k_scale.item()
         self._v_scale_float = self._v_scale.item()
-        # [FORK] int8_per_tensor debug: print the actually calibrated scales
+        # [FORK] int8_per_tensor debug: log the actually calibrated scales
         if self.kv_cache_dtype == "int8_per_tensor":
-            print(
-                f"[FORK-INT8SCALE] {self.layer_name} k_scale={self._k_scale_float:.6f} "
-                f"v_scale={self._v_scale_float:.6f} "
-                f"k_absmax={torch.abs(key).max().item():.4f} "
-                f"v_absmax={torch.abs(value).max().item():.4f}",
-                flush=True,
+            logger.debug(
+                "[FORK-INT8SCALE] %s k_scale=%.6f v_scale=%.6f "
+                "k_absmax=%.4f v_absmax=%.4f",
+                self.layer_name, self._k_scale_float, self._v_scale_float,
+                torch.abs(key).max().item(), torch.abs(value).max().item(),
             )
         # We only calculate the scales once
         self.calculate_kv_scales = False
