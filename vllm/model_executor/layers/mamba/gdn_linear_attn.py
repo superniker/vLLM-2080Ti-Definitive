@@ -903,7 +903,22 @@ class GatedDeltaNetAttention(PluggableLayer, MambaBase):
             if os.getenv("VLLM_GGUF_FP32", "0") != "1":
                 proj_in = proj_in.to(torch.float16)
         else:
-            proj_in = proj_in.to(self.out_proj.weight.dtype)
+            # Plain (non-quantized) weight: cast to the weight dtype. Guard
+            # against FP8-quantized out_proj here: such layers carry a plain
+            # `weight` attribute whose dtype is the FP8 *storage* dtype, but
+            # Fp8LinearMethod.apply expects fp16/bf16 activations and dequant
+            # the weight internally (review #107 round 7 P1).
+            _w = getattr(self.out_proj, "weight", None)
+            if _w is not None and _w.dtype in (torch.float8_e4m3fn,
+                                               torch.float8_e5m2):
+                # FP8 storage dtype: keep activations in a non-FP8 compute
+                # dtype (the FP8 kernel quantizes internally). Prefer the
+                # activation's own dtype so bf16 models are not downcast to
+                # fp16 (review #107 round 7 P1).
+                if proj_in.dtype not in (torch.float16, torch.bfloat16):
+                    proj_in = proj_in.to(torch.float16)
+            elif _w is not None:
+                proj_in = proj_in.to(_w.dtype)
         output_chunk, _ = self.out_proj(proj_in)
         output[:num_tokens] = output_chunk
 
@@ -1626,10 +1641,24 @@ class GatedDeltaNetAttention(PluggableLayer, MambaBase):
             initial_state[~prefill_has_initial_state, ...] = 0
             if _GDN_GGUF_LAYOUT:
                 # [FORK compatibility] GGUF: run the kernel directly (mod16 +
-                # v_start); the per-token state output must be sliced
+                # v_start). Fix the initial-state lookup (review #107 round 7
+                # P1): with a per-sequence slice and no ssm_state_indices the
+                # kernel indexes h0 by the cumulative *token* offset (bos)
+                # under IS_VARLEN, so every sequence after the first reads the
+                # wrong initial state. Pass the full ssm_state plus per-seq
+                # indices instead. Do NOT use inplace_final_state=True here:
+                # the kernel's in-place store is per-token (indexes
+                # indices[i_n*stride_seq + i_t]), which with 1-D per-seq
+                # indices and T>1 writes each token into the next sequence's
+                # slot / out of bounds. Keep per-token output and slice the
+                # last token's state, as the pre-existing code did. Sequences
+                # without initial state are zeroed in place first (PAD_SLOT_ID
+                # would make the kernel return early and skip the whole
+                # sequence — wrong for real prefill rows).
+                ssm_state[prefill_state_indices[~prefill_has_initial_state]] = 0
                 (
                     core_attn_out_non_spec,
-                    last_recurrent_state,
+                    final_states,
                 ) = fused_sigmoid_gating_delta_rule_update(
                     A_log=self.A_log,
                     a=a_prefill,
@@ -1638,16 +1667,18 @@ class GatedDeltaNetAttention(PluggableLayer, MambaBase):
                     q=query_non_spec,
                     k=key_non_spec,
                     v=value_non_spec,
-                    initial_state=initial_state.clone(),
+                    initial_state=ssm_state,
                     inplace_final_state=False,
                     cu_seqlens=prefill_query_start_loc,
+                    ssm_state_indices=prefill_state_indices,
                     use_qk_l2norm_in_kernel=True,
                     v_start=self._gdn_v_start,
                     gguf_layout=True,
+                    null_block_id=PAD_SLOT_ID,
                 )
-                # Kernel outputs per-token state; take the last token's state
-                # of each sequence
-                last_recurrent_state = last_recurrent_state[
+                # Per-token state output: take the last token's state of each
+                # sequence
+                last_recurrent_state = final_states[
                     prefill_query_start_loc[1:] - 1
                 ]
             else:
@@ -1676,6 +1707,11 @@ class GatedDeltaNetAttention(PluggableLayer, MambaBase):
                 and _GDN_DEBUG_PREFILL_USED < 8
                 and _is_real_request_forward()
             ):
+                # NOTE: debug-only reference (VLLM_GDN_DEBUG_PREFILL=1). It
+                # uses the zeroed per-sequence slice; under GGUF with
+                # multi-sequence batches the bos indexing is out-of-range for
+                # seq>0 (approximate at best, CUDA illegal access at worst),
+                # but this only affects debug comparison, not production.
                 ref_out, ref_state = fused_sigmoid_gating_delta_rule_update(
                     A_log=self.A_log,
                     a=a_prefill,
