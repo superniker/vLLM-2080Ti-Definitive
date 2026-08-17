@@ -657,14 +657,21 @@ def maybe_calc_kv_scales(
     if torch.cuda.is_current_stream_capturing():
         return
 
-    # [FORK] int8_per_tensor calibration runs on the first real eager prefill
-    # (the capture guard above already skipped dummy/graph-warmup runs).
-    # No query.shape[0] gate here: chunked prefill schedules long prompts in
-    # chunks smaller than 2048 tokens, and gating on chunk length would defer
-    # calibration forever (review #106). Short requests are CUDA-graph
-    # captured, so they also return at the guard above — calibration only
-    # happens on a genuine non-captured prefill. Other quantized KV dtypes
-    # (fp8 etc.) keep upstream first-forward calibration.
+    # [FORK] int8_per_tensor: defer calibration until a calibration-ready
+    # prefill — the first execute_model runs with cudagraph_mode=NONE, so a
+    # short first request (e.g. "12*8") would reach this point and freeze
+    # undersized int8 scales, clipping larger K/V values later (review #106
+    # P1). Gate on the request's TOTAL sequence length (max_seq_len, includes
+    # context) instead of the chunk length: chunked prefill schedules long
+    # prompts in chunks < 2048 tokens, and gating on chunk length would defer
+    # calibration forever (review #106 P2). Other quantized KV dtypes (fp8
+    # etc.) keep upstream first-forward calibration.
+    if self.kv_cache_dtype == "int8_per_tensor":
+        _md = getattr(forward_context, "attn_metadata", None)
+        _max_seq_len = getattr(getattr(_md, "prefill", None), "max_seq_len", 0)
+        if _max_seq_len < 2048:
+            return
+
     self.calc_kv_scales(query, key, value)
 
 
