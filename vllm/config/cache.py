@@ -258,13 +258,6 @@ class CacheConfig:
                 "Dynamic per-token-head scales will be computed at runtime.",
                 str(cache_dtype),
             )
-        elif cache_dtype == "int8_per_tensor":  # [FORK-PORT] PR#41505
-            logger.info(
-                "Using int8_per_tensor data type to store kv cache. "
-                "It reduces the GPU memory footprint and boosts the "
-                "performance. Meanwhile, it may cause accuracy drop "
-                "without a proper scaling factor",
-            )
         elif is_quantized_kv_cache(cache_dtype):
             logger.info(
                 "Using %s data type to store kv cache. It reduces the GPU "
