@@ -531,7 +531,12 @@ class Attention(nn.Module, AttentionLayerBase):
         if self.kv_cache_dtype == "int8_per_tensor":
             k_absmax = torch.abs(key).max().item()
             v_absmax = torch.abs(value).max().item()
-            if k_absmax == 0.0 and v_absmax == 0.0:
+            if k_absmax == 0.0 or v_absmax == 0.0:
+                # All-or-nothing calibration: with either tensor still zero,
+                # update neither scale and wait for the next eligible batch
+                # (review #106 round 8 P1 — partial updates corrupt the cache
+                # because values written under the old scale would later be
+                # dequantized with the new one).
                 logger.debug(
                     "[FORK-INT8SCALE] %s skip zero-value calibration "
                     "(k_absmax=%.6f v_absmax=%.6f), waiting for real request",
@@ -541,13 +546,18 @@ class Attention(nn.Module, AttentionLayerBase):
         self._q_scale.copy_(torch.abs(query).max() / self.q_range)
         if self.kv_cache_dtype == "int8_per_tensor":
             # Reuse the k_absmax/v_absmax computed above instead of re-running
-            # two full reductions (review #106 round 6 P2). Calibrate each
-            # tensor independently: a zero K (or V) keeps its previous scale
-            # while the nonzero one is calibrated (review #106 round 7 P2).
-            if k_absmax > 0.0:
-                self._k_scale.copy_(k_absmax / self.k_range)
-            if v_absmax > 0.0:
-                self._v_scale.copy_(v_absmax / self.v_range)
+            # two full reductions (review #106 round 6 P2). Calibration is
+            # all-or-nothing: when one tensor is still zero, update neither
+            # scale and stay pending. Partially updating (round 8 P1) leaves
+            # the zero side at the default 1.0 while calibration finishes, so
+            # values already written to the cache under 1.0 are later
+            # dequantized with a different scale, corrupting prior context.
+            # A zero K (or V) on a real prefill is degenerate (both come from
+            # the same input projection), so waiting for the next batch is
+            # safe; both scales are calibrated together once both tensors
+            # have nonzero maxima.
+            self._k_scale.copy_(k_absmax / self.k_range)
+            self._v_scale.copy_(v_absmax / self.v_range)
         else:
             self._k_scale.copy_(torch.abs(key).max() / self.k_range)
             self._v_scale.copy_(torch.abs(value).max() / self.v_range)
@@ -565,16 +575,11 @@ class Attention(nn.Module, AttentionLayerBase):
                 self.layer_name, self._k_scale_float, self._v_scale_float,
                 k_absmax, v_absmax,
             )
-        # We only calculate the scales once. If one tensor was still zero
-        # (its scale left at the default), keep calibration pending so a
-        # later nonzero value is not clipped by a stale 1.0 scale; only
-        # finish when both K and V have nonzero maxima (review #106 round 8
-        # P1).
-        if (
-            self.kv_cache_dtype != "int8_per_tensor"
-            or (k_absmax > 0.0 and v_absmax > 0.0)
-        ):
-            self.calculate_kv_scales = False
+        # We only calculate the scales once. By the time we reach this point
+        # the all-or-nothing guard above has returned for any batch with a
+        # zero tensor, so both scales are freshly calibrated here and it is
+        # safe to finish (review #106 round 8 P1).
+        self.calculate_kv_scales = False
 
     def extra_repr(self) -> str:
         s = f"head_size={self.impl.head_size}"  # type: ignore
