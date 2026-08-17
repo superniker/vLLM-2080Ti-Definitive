@@ -541,8 +541,14 @@ class Attention(nn.Module, AttentionLayerBase):
                 )
                 return
         self._q_scale.copy_(torch.abs(query).max() / self.q_range)
-        self._k_scale.copy_(torch.abs(key).max() / self.k_range)
-        self._v_scale.copy_(torch.abs(value).max() / self.v_range)
+        if self.kv_cache_dtype == "int8_per_tensor":
+            # Reuse the k_absmax/v_absmax computed above instead of re-running
+            # two full reductions (review #106 round 6 P2).
+            self._k_scale.copy_(k_absmax / self.k_range)
+            self._v_scale.copy_(v_absmax / self.v_range)
+        else:
+            self._k_scale.copy_(torch.abs(key).max() / self.k_range)
+            self._v_scale.copy_(torch.abs(value).max() / self.v_range)
         self._q_scale_float = self._q_scale.item()
         self._k_scale_float = self._k_scale.item()
         self._v_scale_float = self._v_scale.item()
@@ -651,16 +657,16 @@ def maybe_calc_kv_scales(
     # calc_kv_scales contains .item() CPU sync, which triggers
     # cudaErrorStreamCaptureInvalidated during capture. Keep the flag until the
     # first real eager prefill (long chunk exceeds graph capture size) to
-    # calibrate.
-    _cudagraph_mode = getattr(forward_context, "cudagraph_runtime_mode", None)
-    if _cudagraph_mode is not None and _cudagraph_mode.name != "NONE":
-        return
-    # [FORK] FULL CUDA-graph capture passes cudagraph_runtime_mode=NONE, so the
-    # mode guard above is insufficient — detect an active stream capture instead
-    # (review #106 P1). torch.cuda.is_current_stream_capturing() is cheap and
-    # returns True only on the capturing stream.
-    if torch.cuda.is_current_stream_capturing():
-        return
+    # calibrate. Scoped to int8_per_tensor so other quantized KV dtypes (fp8
+    # etc.) keep upstream first-forward calibration timing (review #106 round
+    # 6 P2). The capture checks are only evaluated on the int8 path.
+    if self.kv_cache_dtype == "int8_per_tensor":
+        _cudagraph_mode = getattr(forward_context, "cudagraph_runtime_mode", None)
+        _in_cudagraph = (
+            _cudagraph_mode is not None and _cudagraph_mode.name != "NONE"
+        ) or torch.cuda.is_current_stream_capturing()
+        if _in_cudagraph:
+            return
 
     # [FORK] int8_per_tensor: defer calibration until a calibration-ready
     # prefill — the first execute_model runs with cudagraph_mode=NONE, so a
@@ -699,6 +705,16 @@ def maybe_calc_kv_scales(
                 and _is_prefilling.numel() == _seq_lens_cpu.numel()
             ):
                 _seq_lens_cpu = _seq_lens_cpu[_is_prefilling]
+            elif (
+                _seq_lens_cpu is not None
+                and _is_prefilling is not None
+                and _is_prefilling.numel() != _seq_lens_cpu.numel()
+            ):
+                logger.debug(
+                    "[FORK-INT8SCALE] %s is_prefilling(%d) vs seq_lens_cpu(%d) "
+                    "shape mismatch, falling back to unfiltered seq_lens_cpu",
+                    layer_name, _is_prefilling.numel(), _seq_lens_cpu.numel(),
+                )
         _max_seq_len = 0
         if _seq_lens_cpu is not None and _seq_lens_cpu.numel() > 0:
             _max_seq_len = int(_seq_lens_cpu.max().item())
