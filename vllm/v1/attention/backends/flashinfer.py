@@ -1534,13 +1534,17 @@ class FlashInferImpl(AttentionImpl):
 
         num_actual_tokens = attn_metadata.num_actual_tokens
 
+        # [FORK] Whether decode takes the Triton fast path (int8, 1 token per
+        # request, no padding rows). Initialized here (method scope) so the
+        # decode branch below never reads an unbound name; set inside the
+        # int8_per_tensor branch below.
+        _use_triton_decode = False
+
         # The FlashInfer api requires data to be in fp8_e4m3 or fp8_e5m2
         # to process the cache when the kv_cache_dtype is fp8
         if self.kv_sharing_target_layer_name is None and is_quantized_kv_cache(
             self.kv_cache_dtype
         ):
-            # [FORK] Whether decode takes the Triton fast path (int8, 1 token per request, no padding rows)
-            _use_triton_decode = False
             if self.kv_cache_dtype == "int8_per_tensor":
                 # [FORK] int8_per_tensor: FlashInfer kernels have no int8 branch
                 # (0.6.8 lists the enum but ships no template; feeding int8 raw
@@ -1875,9 +1879,7 @@ class FlashInferImpl(AttentionImpl):
                         get_dcp_group(),
                     )
                 else:
-                    if self.kv_cache_dtype == "int8_per_tensor" and (
-                        _kv_cache_int8 is not None
-                    ) and _use_triton_decode:
+                    if self.kv_cache_dtype == "int8_per_tensor" and _use_triton_decode:
                         # [FORK] int8 decode goes through the Triton kernel:
                         # FlashInfer 0.6.8 has no int8 decode template (whole-
                         # pool dequant: 5.7 tok/s); Triton unified_attention

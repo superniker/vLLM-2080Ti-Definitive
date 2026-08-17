@@ -103,7 +103,13 @@ def reshape_and_cache_kernel_flash(
         elif IS_CUDA:
             k_rounded = tl.extra.cuda.libdevice.rint(k_scaled)
         else:
-            k_rounded = tl.floor(k_scaled + 0.5)
+            # Round half away from zero (floor(x+0.5) is wrong for negative
+            # half-integers: -1.5 would floor to -1 instead of -2).
+            k_rounded = tl.where(
+                k_scaled >= 0.0,
+                tl.floor(k_scaled + 0.5),
+                tl.ceil(k_scaled - 0.5),
+            )
         key_tile = tl.clamp(k_rounded, -128.0, 127.0).to(tl.int8)
     elif FP8_KV_CACHE:
         # tl.store will do the correct implicit cast to fp8,
