@@ -511,6 +511,8 @@ class Attention(nn.Module, AttentionLayerBase):
         # uninitialized during calibration). Skip zero-value calibration and keep
         # the calculate_kv_scales flag; calibrate on the first real request
         # (long prefill) instead.
+        k_absmax = 0.0
+        v_absmax = 0.0
         if self.kv_cache_dtype == "int8_per_tensor":
             k_absmax = torch.abs(key).max().item()
             v_absmax = torch.abs(value).max().item()
@@ -522,18 +524,27 @@ class Attention(nn.Module, AttentionLayerBase):
                 )
                 return
         self._q_scale.copy_(torch.abs(query).max() / self.q_range)
-        self._k_scale.copy_(torch.abs(key).max() / self.k_range)
-        self._v_scale.copy_(torch.abs(value).max() / self.v_range)
+        if self.kv_cache_dtype == "int8_per_tensor":
+            # Reuse the k_absmax/v_absmax computed above instead of re-running
+            # two full reductions (review #109 round 6).
+            self._k_scale.copy_(k_absmax / self.k_range)
+            self._v_scale.copy_(v_absmax / self.v_range)
+        else:
+            self._k_scale.copy_(torch.abs(key).max() / self.k_range)
+            self._v_scale.copy_(torch.abs(value).max() / self.v_range)
         self._q_scale_float = self._q_scale.item()
         self._k_scale_float = self._k_scale.item()
         self._v_scale_float = self._v_scale.item()
-        # [FORK] int8_per_tensor debug: log the actually calibrated scales
+        # [FORK] int8_per_tensor debug: log the actually calibrated scales.
+        # k_absmax/v_absmax are already computed above for the zero-value
+        # check; reuse them instead of re-running two full reductions
+        # (logger.debug args are evaluated unconditionally, review #109 P3).
         if self.kv_cache_dtype == "int8_per_tensor":
             logger.debug(
                 "[FORK-INT8SCALE] %s k_scale=%.6f v_scale=%.6f "
                 "k_absmax=%.4f v_absmax=%.4f",
                 self.layer_name, self._k_scale_float, self._v_scale_float,
-                torch.abs(key).max().item(), torch.abs(value).max().item(),
+                k_absmax, v_absmax,
             )
         # We only calculate the scales once
         self.calculate_kv_scales = False
@@ -629,9 +640,15 @@ def maybe_calc_kv_scales(
     # calc_kv_scales contains .item() CPU sync, which triggers
     # cudaErrorStreamCaptureInvalidated during capture. Keep the flag until the
     # first real eager prefill (long chunk exceeding the graph capture size)
-    # calibrates.
+    # calibrates. FULL CUDA-graph capture passes cudagraph_runtime_mode=NONE,
+    # so an active stream capture is also detected. Scoped to int8_per_tensor
+    # so other quantized KV dtypes (fp8 etc.) keep upstream first-forward
+    # calibration timing (review #109 round 6 P2).
     _cudagraph_mode = getattr(forward_context, "cudagraph_runtime_mode", None)
-    if _cudagraph_mode is not None and _cudagraph_mode.name != "NONE":
+    _in_cudagraph = (
+        _cudagraph_mode is not None and _cudagraph_mode.name != "NONE"
+    ) or torch.cuda.is_current_stream_capturing()
+    if self.kv_cache_dtype == "int8_per_tensor" and _in_cudagraph:
         return
 
     self.calc_kv_scales(query, key, value)
