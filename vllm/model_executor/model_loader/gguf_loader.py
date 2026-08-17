@@ -11,7 +11,6 @@ import torch.nn as nn
 from huggingface_hub import hf_hub_download
 from transformers import AutoModelForCausalLM, AutoModelForImageTextToText
 
-from vllm import _custom_ops as ops
 from vllm.config import ModelConfig, VllmConfig
 from vllm.config.load import LoadConfig
 from vllm.logger import init_logger

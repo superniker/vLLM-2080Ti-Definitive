@@ -32,22 +32,6 @@ from vllm.model_executor.layers.layernorm import (
     GemmaRMSNorm,
     RMSNorm,
 )
-
-# [FORK compatibility] GGUF RMSNorm weights already include +1 (llama.cpp
-# convention, see conversion/gemma.py norm_shift), so plain RMSNorm must be
-# used to multiply directly; safetensors weights are raw w (1+w semantics), so
-# use GemmaRMSNorm. Consistent with upstream vLLM PR #31464/#37220 Gemma2/3
-# GGUF fixes.
-# Note: cannot branch on vllm_config.quant_config (it is None on the GGUF
-# path); use model_config.load_format. Other formats (safetensors/AWQ etc.)
-# default to the original GemmaRMSNorm.
-def _get_qwen3_next_rms_norm_cls(load_format) -> type:
-    if load_format == "gguf":
-        return RMSNorm
-    return GemmaRMSNorm
-
-
-Qwen3NextRMSNorm = GemmaRMSNorm
 from vllm.model_executor.layers.linear import (
     QKVParallelLinear,
     ReplicatedLinear,
@@ -93,6 +77,22 @@ from .utils import (
     make_layers,
     maybe_prefix,
 )
+
+# [FORK compatibility] GGUF RMSNorm weights already include +1 (llama.cpp
+# convention, see conversion/gemma.py norm_shift), so plain RMSNorm must be
+# used to multiply directly; safetensors weights are raw w (1+w semantics), so
+# use GemmaRMSNorm. Consistent with upstream vLLM PR #31464/#37220 Gemma2/3
+# GGUF fixes.
+# Note: cannot branch on vllm_config.quant_config (it is None on the GGUF
+# path); use model_config.load_format. Other formats (safetensors/AWQ etc.)
+# default to the original GemmaRMSNorm.
+def _get_qwen3_next_rms_norm_cls(load_format) -> type:
+    if load_format == "gguf":
+        return RMSNorm
+    return GemmaRMSNorm
+
+
+Qwen3NextRMSNorm = GemmaRMSNorm
 
 logger = init_logger(__name__)
 

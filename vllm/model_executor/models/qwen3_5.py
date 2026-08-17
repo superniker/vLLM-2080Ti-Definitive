@@ -40,14 +40,6 @@ from vllm.model_executor.layers.layernorm import (
     GemmaRMSNorm as Qwen3_5RMSNorm,
     RMSNorm,
 )
-
-# [FORK compatibility] GGUF RMSNorm weights already include +1 (llama.cpp
-# convention), so use plain RMSNorm; safetensors/AWQ etc. use the original
-# GemmaRMSNorm (1+w semantics).
-def _get_qwen3_5_rms_norm_cls(load_format) -> type:
-    if load_format == "gguf":
-        return RMSNorm
-    return Qwen3_5RMSNorm
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.mamba.gdn_linear_attn import GatedDeltaNetAttention
 from vllm.model_executor.layers.mamba.mamba_utils import (
@@ -110,6 +102,14 @@ from .utils import (
     make_layers,
     maybe_prefix,
 )
+
+# [FORK compatibility] GGUF RMSNorm weights already include +1 (llama.cpp
+# convention), so use plain RMSNorm; safetensors/AWQ etc. use the original
+# GemmaRMSNorm (1+w semantics).
+def _get_qwen3_5_rms_norm_cls(load_format) -> type:
+    if load_format == "gguf":
+        return RMSNorm
+    return Qwen3_5RMSNorm
 
 logger = init_logger(__name__)
 

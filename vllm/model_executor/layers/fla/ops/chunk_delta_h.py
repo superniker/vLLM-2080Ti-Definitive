@@ -16,7 +16,6 @@ from .index import prepare_chunk_indices, prepare_chunk_offsets
 from .op import exp
 from .utils import FLA_CHUNK_SIZE, use_cuda_graph
 
-NUM_WARPS = [2, 4, 8, 16]
 
 
 @triton.heuristics(
