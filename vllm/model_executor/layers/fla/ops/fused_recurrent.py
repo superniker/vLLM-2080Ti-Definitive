@@ -62,8 +62,13 @@ def fused_recurrent_gated_delta_rule_fwd_kernel(
 ):
     i_k, i_v, i_nh = tl.program_id(0), tl.program_id(1), tl.program_id(2)
     i_n, i_hv = i_nh // HV, i_nh % HV
-    # llama.cpp fused GDN: k-head = v-head % num_k_heads (fastmodulo(h_idx, neqk1))
-    i_h = i_hv % H
+    # This kernel backs the generic fused_recurrent_gated_delta_rule API used
+    # by non-GGUF callers (e.g. olmo_hybrid), whose layouts use the official
+    # div3 grouping: v-head // (HV // H) maps each contiguous group of value
+    # heads to one query/key head (review #107 #9). GGUF mod16 is served by
+    # fused_sigmoid_gating_delta_rule_update / packed decode, which carry
+    # their own layout branch and v_start.
+    i_h = i_hv // (HV // H)
     if IS_VARLEN:
         bos, eos = (
             tl.load(cu_seqlens + i_n).to(tl.int64),

@@ -596,8 +596,15 @@ class GatedDeltaNetAttention(PluggableLayer, MambaBase):
         )
 
         self.chunk_gated_delta_rule = ChunkGatedDeltaRule()
+        # [FORK compatibility] Packed decode is disabled under GGUF (mod16)
+        # layout with TP>1: its kernel maps i_h = i_hv % H over this rank's
+        # local half of mixed_qkv without gathering q/k, but the GGUF
+        # v-head -> k-head mapping (v % num_k_heads) needs the full 16 k-heads
+        # plus the v_start offset (review #107 #24). The non-packed path below
+        # all-gathers q/k and threads v_start, so route GGUF TP>1 there.
         self.enable_packed_recurrent_decode = (
             envs.VLLM_ENABLE_FLA_PACKED_RECURRENT_DECODE
+            and not (_GDN_GGUF_LAYOUT and self.tp_size > 1)
         )
 
         compilation_config = get_current_vllm_config().compilation_config
@@ -1000,7 +1007,7 @@ class GatedDeltaNetAttention(PluggableLayer, MambaBase):
         # see discussions in https://github.com/vllm-project/vllm/pull/28182
         core_attn_out = torch.zeros(
             (num_tokens, self.num_v_heads // self.tp_size, self.head_v_dim),
-            dtype=torch.float32,  # [FORK 兼容] GGUF FP32 链:core 必须 FP32(AWQ 在 proj_in 分流回 FP16)
+            dtype=torch.float32,  # [FORK compatibility] GGUF FP32 chain: core must stay FP32 (AWQ branches back to FP16 in proj_in)
             device=hidden_states.device,
         )
 
@@ -1417,6 +1424,21 @@ class GatedDeltaNetAttention(PluggableLayer, MambaBase):
             mixed_qkv_non_spec = None
 
         query_spec, key_spec, value_spec = self.rearrange_mixed_qkv(mixed_qkv_spec)
+        if (
+            spec_sequence_masks is not None
+            and self.tp_size > 1
+            and _GDN_GGUF_LAYOUT
+        ):
+            # [FORK compatibility] GGUF (mod16) needs full q/k for the
+            # v-head -> k-head mapping; spec q/k are rank-local at this point,
+            # so gather them like the non-spec GGUF paths do (review #107 #14).
+            # Only runs in spec mode: mixed_qkv_spec is None otherwise and
+            # query_spec/key_spec would be None (rearrange_mixed_qkv returns
+            # None triples for None input).
+            assert query_spec is not None and key_spec is not None
+            _tp_grp = get_tp_group()
+            query_spec = _tp_grp._all_gather_out_place(query_spec, 2)
+            key_spec = _tp_grp._all_gather_out_place(key_spec, 2)
         split_non_spec = (
             spec_sequence_masks is None
             and attn_metadata.num_prefills > 0
@@ -1562,14 +1584,14 @@ class GatedDeltaNetAttention(PluggableLayer, MambaBase):
             )
             if self.tp_size > 1 and _GDN_GGUF_LAYOUT:
                 # [FORK compatibility] Only the GGUF (mod16) layout needs full
-                # q/k gather (AWQ div3 uses this rank's half directly)
+                # q/k gather (AWQ div3 uses this rank's half directly).
+                # query/key from rearrange_mixed_qkv are already (1, T, H, K):
+                # gather on dim 2 (head axis) — do NOT unsqueeze first, which
+                # would shift dim 2 onto the token axis and leave heads
+                # rank-local (review #107 #14, subagent review).
                 _tp_grp = get_tp_group()
-                query_decode = _tp_grp._all_gather_out_place(
-                    query_decode.unsqueeze(0), 2
-                ).squeeze(0)
-                key_decode = _tp_grp._all_gather_out_place(
-                    key_decode.unsqueeze(0), 2
-                ).squeeze(0)
+                query_decode = _tp_grp._all_gather_out_place(query_decode, 2)
+                key_decode = _tp_grp._all_gather_out_place(key_decode, 2)
             core_attn_out_decode, _ = fused_sigmoid_gating_delta_rule_update(
                 A_log=self.A_log,
                 a=a_non_spec[:num_decode_tokens],
@@ -1585,8 +1607,8 @@ class GatedDeltaNetAttention(PluggableLayer, MambaBase):
                 ],
                 ssm_state_indices=decode_state_indices,
                 use_qk_l2norm_in_kernel=True,
-                v_start=self._gdn_v_start,  # [FORK 兼容] 仅 GGUF 非 0
-                gguf_layout=_GDN_GGUF_LAYOUT,  # [FORK 兼容] GGUF=mod16,其他=div3
+                v_start=self._gdn_v_start,  # [FORK compatibility] non-zero only for GGUF
+                gguf_layout=_GDN_GGUF_LAYOUT,  # [FORK compatibility] GGUF=mod16, others=div3
                 null_block_id=PAD_SLOT_ID,
             )
         else:
@@ -1666,6 +1688,8 @@ class GatedDeltaNetAttention(PluggableLayer, MambaBase):
                     inplace_final_state=False,
                     cu_seqlens=prefill_query_start_loc,
                     use_qk_l2norm_in_kernel=True,
+                    v_start=self._gdn_v_start,  # [FORK compatibility] match GGUF prefill mapping
+                    gguf_layout=_GDN_GGUF_LAYOUT,  # [FORK compatibility] GGUF=mod16, others=div3
                 )
                 out_err = (core_attn_out_non_spec.squeeze(0) - ref_out).abs()
                 state_err = (last_recurrent_state - ref_state).abs()
@@ -1703,6 +1727,8 @@ class GatedDeltaNetAttention(PluggableLayer, MambaBase):
                     ],
                     ssm_state_indices=non_spec_state_indices_tensor,
                     use_qk_l2norm_in_kernel=True,
+                    v_start=self._gdn_v_start,  # [FORK compatibility] non-zero only for GGUF
+                    gguf_layout=_GDN_GGUF_LAYOUT,  # [FORK compatibility] GGUF=mod16, others=div3
                     null_block_id=PAD_SLOT_ID,
                 )
             )
@@ -1972,6 +1998,8 @@ class GatedDeltaNetAttention(PluggableLayer, MambaBase):
             ),
             ssm_state_indices=local_state_indices,
             use_qk_l2norm_in_kernel=True,
+            v_start=self._gdn_v_start,  # [FORK compatibility] match packed decode GGUF mapping
+            gguf_layout=_GDN_GGUF_LAYOUT,  # [FORK compatibility] GGUF=mod16, others=div3
             null_block_id=PAD_SLOT_ID,
         )
         err = (core_attn_out - ref).abs()
@@ -1993,6 +2021,8 @@ class GatedDeltaNetAttention(PluggableLayer, MambaBase):
             ),
             ssm_state_indices=local_state_indices,
             use_qk_l2norm_in_kernel=True,
+            v_start=self._gdn_v_start,  # [FORK compatibility] match packed decode GGUF mapping
+            gguf_layout=_GDN_GGUF_LAYOUT,  # [FORK compatibility] GGUF=mod16, others=div3
             null_block_id=PAD_SLOT_ID,
         )
         state_err = (ssm_state_after - ref_state).abs()
@@ -2071,6 +2101,8 @@ class GatedDeltaNetAttention(PluggableLayer, MambaBase):
             ),
             ssm_state_indices=local_state_indices,
             use_qk_l2norm_in_kernel=True,
+            v_start=self._gdn_v_start,  # [FORK compatibility] match split decode GGUF mapping
+            gguf_layout=_GDN_GGUF_LAYOUT,  # [FORK compatibility] GGUF=mod16, others=div3
             null_block_id=PAD_SLOT_ID,
         )
         recurrent_err = (core_attn_out - recurrent_ref).abs()
