@@ -657,14 +657,14 @@ def maybe_calc_kv_scales(
     if torch.cuda.is_current_stream_capturing():
         return
 
-    # [FORK] int8_per_tensor: defer calibration until a real long prefill —
-    # a short first request (dummy/graph warmup) underestimates long-context
-    # ranges and clips later K/V values (review #106 P1, hybrid recurrent
-    # state garbage is nonzero so the zero-value check below cannot catch it).
-    # Keep calculate_kv_scales set so the next long request calibrates.
-    if query.shape[0] < 2048:
-        return
-
+    # [FORK] int8_per_tensor calibration runs on the first real eager prefill
+    # (the capture guard above already skipped dummy/graph-warmup runs).
+    # No query.shape[0] gate here: chunked prefill schedules long prompts in
+    # chunks smaller than 2048 tokens, and gating on chunk length would defer
+    # calibration forever (review #106). Short requests are CUDA-graph
+    # captured, so they also return at the guard above — calibration only
+    # happens on a genuine non-captured prefill. Other quantized KV dtypes
+    # (fp8 etc.) keep upstream first-forward calibration.
     self.calc_kv_scales(query, key, value)
 
 
