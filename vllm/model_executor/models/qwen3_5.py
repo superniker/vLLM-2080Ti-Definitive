@@ -166,6 +166,7 @@ class Qwen3_5DecoderLayer(Qwen3NextDecoderLayer):
                 model_config=model_config,
                 cache_config=cache_config,
                 quant_config=quant_config,
+                load_format=_lf,
                 prefix=f"{prefix}.self_attn",
             )
         else:

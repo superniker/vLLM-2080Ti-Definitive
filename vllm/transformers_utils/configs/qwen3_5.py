@@ -203,7 +203,11 @@ class Qwen3_5Config(PretrainedConfig):
                 "eos_token_id",
             )
             self.text_config = self.sub_configs["text_config"](
-                **{k: v for k, v in kwargs.items() if k in _text_keys}
+                **{k: v for k, v in kwargs.items() if k in _text_keys},
+                # tie_word_embeddings is an explicit named arg (not in kwargs),
+                # so the _text_keys filter would drop it and leave the nested
+                # text_config at the default False (review #107).
+                tie_word_embeddings=tie_word_embeddings,
             )
 
         self.image_token_id = image_token_id

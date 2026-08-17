@@ -763,9 +763,12 @@ def get_config(
 
     # Special architecture mapping check for GGUF models
     if _is_gguf:
-        if config.model_type not in MODEL_FOR_CAUSAL_LM_MAPPING_NAMES:
+        # [FORK] qwen35 is our registered alias for qwen3_5; the transformers
+        # registry only knows qwen3_5 (review #107).
+        _model_type = "qwen3_5" if config.model_type == "qwen35" else config.model_type
+        if _model_type not in MODEL_FOR_CAUSAL_LM_MAPPING_NAMES:
             raise RuntimeError(f"Can't get gguf config for {config.model_type}.")
-        model_type = MODEL_FOR_CAUSAL_LM_MAPPING_NAMES[config.model_type]
+        model_type = MODEL_FOR_CAUSAL_LM_MAPPING_NAMES[_model_type]
         config.update({"architectures": [model_type]})
         # Qwen3_5Config always has vision_config, which makes vLLM misdetect
         # it as multimodal (ForConditionalGeneration). When the GGUF main file
