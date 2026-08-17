@@ -194,7 +194,7 @@ class Qwen3_5Config(PretrainedConfig):
                 "num_hidden_layers", "num_attention_heads",
                 "num_key_value_heads", "hidden_act",
                 "max_position_embeddings", "initializer_range",
-                "rms_norm_eps", "use_cache", "tie_word_embeddings",
+                "rms_norm_eps", "use_cache",
                 "rope_parameters", "attention_bias", "attention_dropout",
                 "head_dim", "linear_conv_kernel_dim", "linear_key_head_dim",
                 "linear_value_head_dim", "linear_num_key_heads",
