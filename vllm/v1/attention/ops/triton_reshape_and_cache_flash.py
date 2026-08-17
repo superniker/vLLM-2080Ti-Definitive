@@ -38,10 +38,8 @@ def reshape_and_cache_kernel_flash(
     USE_HEAD_MAJOR_LAYOUT: tl.constexpr,
     # FP8 flags
     FP8_KV_CACHE: tl.constexpr,
-    # [FORK-PORT] PR#41505: INT8 per-tensor flag + platform flags
+    # [FORK-PORT] PR#41505: INT8 per-tensor flag
     INT8_KV_CACHE: tl.constexpr,
-    IS_ROCM: tl.constexpr,
-    IS_CUDA: tl.constexpr,
     # tune parameters
     TILE_SIZE: tl.constexpr,
 ):
@@ -98,18 +96,15 @@ def reshape_and_cache_kernel_flash(
         # [FORK-PORT] PR#41505: INT8 per-tensor: quantize to [-128, 127]
         k_scale_val = tl.load(k_scale)
         k_scaled = key_load.to(tl.float32) / k_scale_val
-        if IS_ROCM:
-            k_rounded = tl.extra.hip.libdevice.nearbyint(k_scaled)
-        elif IS_CUDA:
-            k_rounded = tl.extra.cuda.libdevice.rint(k_scaled)
-        else:
-            # Round half away from zero (floor(x+0.5) is wrong for negative
-            # half-integers: -1.5 would floor to -1 instead of -2).
-            k_rounded = tl.where(
-                k_scaled >= 0.0,
-                tl.floor(k_scaled + 0.5),
-                tl.ceil(k_scaled - 0.5),
-            )
+        # Round half away from zero on every platform. rint/nearbyint use
+        # ties-to-even (2.5 -> 2), which breaks the symmetric int8 rounding
+        # (floor(x+0.5) is also wrong for negative half-integers: -1.5 would
+        # floor to -1 instead of -2). Use explicit sign-aware floor/ceil.
+        k_rounded = tl.where(
+            k_scaled >= 0.0,
+            tl.floor(k_scaled + 0.5),
+            tl.ceil(k_scaled - 0.5),
+        )
         key_tile = tl.clamp(k_rounded, -128.0, 127.0).to(tl.int8)
     elif FP8_KV_CACHE:
         # tl.store will do the correct implicit cast to fp8,
@@ -126,18 +121,13 @@ def reshape_and_cache_kernel_flash(
         # [FORK-PORT] PR#41505: INT8 per-tensor: quantize to [-128, 127]
         v_scale_val = tl.load(v_scale)
         v_scaled = value_load.to(tl.float32) / v_scale_val
-        if IS_ROCM:
-            v_rounded = tl.extra.hip.libdevice.nearbyint(v_scaled)
-        elif IS_CUDA:
-            v_rounded = tl.extra.cuda.libdevice.rint(v_scaled)
-        else:
-            # Round half away from zero (mirror of the K branch fix; floor(x+0.5)
-            # is wrong for negative half-integers).
-            v_rounded = tl.where(
-                v_scaled >= 0.0,
-                tl.floor(v_scaled + 0.5),
-                tl.ceil(v_scaled - 0.5),
-            )
+        # Mirror of the K branch: half away from zero on every platform
+        # (rint/nearbyint use ties-to-even; floor(x+0.5) mishandles negatives).
+        v_rounded = tl.where(
+            v_scaled >= 0.0,
+            tl.floor(v_scaled + 0.5),
+            tl.ceil(v_scaled - 0.5),
+        )
         value_tile = tl.clamp(v_rounded, -128.0, 127.0).to(tl.int8)
     elif FP8_KV_CACHE:
         if value_load.dtype.is_fp8():
@@ -470,8 +460,6 @@ def triton_reshape_and_cache_flash(
         FP8_KV_CACHE=FP8_KV_CACHE,
         # [FORK-PORT] PR#41505
         INT8_KV_CACHE=INT8_KV_CACHE,
-        IS_ROCM=current_platform.is_rocm(),
-        IS_CUDA=current_platform.is_cuda(),
         # autotune parameters
         TILE_SIZE=TILE_SIZE,
         num_warps=num_warps,
