@@ -523,11 +523,13 @@ class Attention(nn.Module, AttentionLayerBase):
         return output.view(-1, hidden_size)
 
     def calc_kv_scales(self, query, key, value):
-        # [FORK] int8_per_tensor: warmup/dummy forward has all-zero K/V →
-        # scale=0 garbage cache (hybrid #37554 confirmed: recurrent state is
-        # uninitialized during calibration). Skip zero-value calibration, keep
-        # the calculate_kv_scales flag, and calibrate on the first real request
-        # (long prefill).
+        # [FORK] int8_per_tensor: warmup/dummy forward passes have all-zero K/V
+        # → scale=0 garbage cache (hybrid #37554 confirmed: recurrent state is
+        # uninitialized during calibration). Skip zero-value calibration and keep
+        # the calculate_kv_scales flag; calibrate on the first real request
+        # (long prefill) instead.
+        k_absmax = 0.0
+        v_absmax = 0.0
         if self.kv_cache_dtype == "int8_per_tensor":
             k_absmax = torch.abs(key).max().item()
             v_absmax = torch.abs(value).max().item()
@@ -544,13 +546,16 @@ class Attention(nn.Module, AttentionLayerBase):
         self._q_scale_float = self._q_scale.item()
         self._k_scale_float = self._k_scale.item()
         self._v_scale_float = self._v_scale.item()
-        # [FORK] int8_per_tensor debug: log the actually calibrated scales
+        # [FORK] int8_per_tensor debug: log the actually calibrated scales.
+        # k_absmax/v_absmax are already computed above for the zero-value
+        # check; reuse them instead of re-running two full reductions
+        # (logger.debug args are evaluated unconditionally, review #106 P3).
         if self.kv_cache_dtype == "int8_per_tensor":
             logger.debug(
                 "[FORK-INT8SCALE] %s k_scale=%.6f v_scale=%.6f "
                 "k_absmax=%.4f v_absmax=%.4f",
                 self.layer_name, self._k_scale_float, self._v_scale_float,
-                torch.abs(key).max().item(), torch.abs(value).max().item(),
+                k_absmax, v_absmax,
             )
         # We only calculate the scales once
         self.calculate_kv_scales = False
@@ -661,11 +666,14 @@ def maybe_calc_kv_scales(
     # prefill — the first execute_model runs with cudagraph_mode=NONE, so a
     # short first request (e.g. "12*8") would reach this point and freeze
     # undersized int8 scales, clipping larger K/V values later (review #106
-    # P1). Gate on the request's TOTAL sequence length (max_seq_len, includes
-    # context) instead of the chunk length: chunked prefill schedules long
-    # prompts in chunks < 2048 tokens, and gating on chunk length would defer
-    # calibration forever (review #106 P2). Other quantized KV dtypes (fp8
-    # etc.) keep upstream first-forward calibration.
+    # P1). Gate on a prefill request's TOTAL sequence length (max_seq_len,
+    # includes context) instead of the chunk length: chunked prefill schedules
+    # long prompts in chunks < 2048 tokens, and gating on chunk length would
+    # defer calibration forever (review #106 P2). Decode-only batches never
+    # calibrate (they carry no new prompt tokens), and in a mixed batch only
+    # the prefill rows' total lengths are considered (review #106 round 5 P1).
+    # Other quantized KV dtypes (fp8 etc.) keep upstream first-forward
+    # calibration.
     if self.kv_cache_dtype == "int8_per_tensor":
         # Resolve the per-layer metadata entry (mirror get_attention_context):
         # forward_context.attn_metadata is dict[layer_name] or, for
@@ -680,8 +688,17 @@ def maybe_calc_kv_scales(
         _seq_lens_cpu = getattr(getattr(_md, "prefill", None), "seq_lens_cpu", None)
         if _seq_lens_cpu is None:
             # Triton attention backend stores seq_lens_cpu on the metadata
-            # object itself rather than under .prefill (review #106).
+            # object itself rather than under .prefill (review #106). Restrict
+            # to prefill rows so an unrelated long decode in the same batch
+            # does not satisfy the gate (review #106 round 5 P1).
             _seq_lens_cpu = getattr(_md, "seq_lens_cpu", None)
+            _is_prefilling = getattr(_md, "is_prefilling", None)
+            if (
+                _seq_lens_cpu is not None
+                and _is_prefilling is not None
+                and _is_prefilling.numel() == _seq_lens_cpu.numel()
+            ):
+                _seq_lens_cpu = _seq_lens_cpu[_is_prefilling]
         _max_seq_len = 0
         if _seq_lens_cpu is not None and _seq_lens_cpu.numel() > 0:
             _max_seq_len = int(_seq_lens_cpu.max().item())
