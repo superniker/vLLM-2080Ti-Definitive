@@ -5,6 +5,9 @@ from collections.abc import Generator
 from typing import TYPE_CHECKING, cast
 
 import gguf
+import numpy as np
+from gguf.constants import GGMLQuantizationType as GGUFQuantType
+from gguf.quants import dequantize as gguf_dequantize
 import regex as re
 import torch
 import torch.nn as nn
@@ -116,6 +119,11 @@ class GGUFModelLoader(BaseModelLoader):
         # models, this returns config itself.
         text_config = config.get_text_config()
         model_type = config.model_type
+        # [FORK compatibility] The HF config (e.g. --hf-config-path) carries
+        # model_type "qwen3_5" while the GGUF architecture is "qwen35";
+        # normalize so the mapping branches below match.
+        if model_type == "qwen3_5":
+            model_type = "qwen35"
         # Qwen3_5Config always creates vision_config; rely on the mmproj file
         is_multimodal = detect_gguf_multimodal(model_config.model) is not None
         gguf_to_hf_name_map = {}
@@ -265,14 +273,20 @@ class GGUFModelLoader(BaseModelLoader):
         # values (names received by load_weights) match
         # Qwen3_5ForConditionalGeneration
         if is_multimodal:
-            state_dict = {
-                (
-                    name.replace("model.", "model.language_model.", 1)
-                    if name.startswith("model.")
-                    else name
-                ): tensor
-                for name, tensor in state_dict.items()
-            }
+            # [FORK compatibility] Qwen3.5 GGUF multimodal: the text
+            # checkpoint prefix must match Qwen3_5ForConditionalGeneration's
+            # params_dict (model.language_model.model.layers.N...). Normalize
+            # the dummy state_dict names: strip any existing language_model.
+            # nesting then re-add the exact expected prefix, so the names
+            # received by load_weights (map values) match params_dict.
+            _renamed: dict = {}
+            for _name, _tensor in state_dict.items():
+                if _name.startswith("model.language_model."):
+                    _name = "model." + _name[len("model.language_model."):]
+                if _name.startswith("model."):
+                    _name = "model.language_model.model." + _name[len("model."):]
+                _renamed[_name] = _tensor
+            state_dict = _renamed
         # [FORK compatibility] Qwen3.5 GGUF multimodal: add vision tower
         # parameter names (the dummy is text-only with no vision params; mmproj
         # weight mapping needs model.visual.* keys). Structure taken from
@@ -379,13 +393,13 @@ class GGUFModelLoader(BaseModelLoader):
             # Strip 'language_model.' prefix for multimodal models - gguf-py
             # tensor mappings expect parameter names without this prefix.
             # Note: 'model.' prefix should be KEPT for text-only models as
-            # gguf-py expects it.
-            if hf_name.startswith("language_model."):
+            # gguf-py expects it. Loop to handle any nesting depth
+            # (language_model.language_model.layers.N...), then re-add the
+            # gguf-py 'model.' prefix exactly once afterwards.
+            while hf_name.startswith("language_model."):
                 hf_name = hf_name[15:]  # Remove 'language_model.'
-                # Re-add 'model.' prefix because gguf-py text tensor maps
-                # expect 'model.layers...' format.
-                if is_multimodal:
-                    hf_name = "model." + hf_name
+            if is_multimodal and not hf_name.startswith("model."):
+                hf_name = "model." + hf_name
 
             # Parse parameter name and suffix
             if hf_name.endswith((".weight", ".bias")):
@@ -418,6 +432,36 @@ class GGUFModelLoader(BaseModelLoader):
             # Priority 2: Search text backbone parameters
             if gguf_name is None:
                 gguf_name = text_name_map.get_name(base_name)
+            # gguf-py only maps bare "lm_head" (not "model.lm_head"): retry
+            # without the model. prefix for parameters that failed above.
+            if gguf_name is None and base_name.startswith("model."):
+                gguf_name = text_name_map.get_name(base_name[len("model."):])
+
+            if gguf_name is None and ".linear_attn." in base_name:
+                # [FORK compatibility] Qwen3.5 linear_attn: map linear-attention
+                # parameter names to GGUF ssm_* tensor names manually so we do
+                # not depend on the gguf-py version shipping SSM_DT mappings.
+                _bid = re.search(r"(?:layers|blocks)\.(\d+)", base_name)
+                _bid = _bid.group(1) if _bid else ""
+                _la = base_name.rsplit(".", 1)[-1]
+                _ssm_map = {
+                    "dt_bias": "ssm_dt",
+                    "A_log": "ssm_a",
+                    "conv1d": "ssm_conv1d",
+                    "norm": "ssm_norm",
+                    "out_proj": "ssm_out",
+                    "in_proj_a": "ssm_alpha",
+                    "in_proj_b": "ssm_beta",
+                }
+                _param = _la.replace("_proj", "").replace(".weight", "")
+                if _param in _ssm_map:
+                    gguf_name = f"blk.{_bid}.{_ssm_map[_param]}"
+                elif _la.endswith("proj.weight"):
+                    # in_proj_qkv/z weight -> attn_qkv/attn_gate
+                    _proj = _la.split(".")[0]
+                    _proj_map = {"in_proj_qkv": "attn_qkv", "in_proj_z": "attn_gate"}
+                    if _proj in _proj_map:
+                        gguf_name = f"blk.{_bid}.{_proj_map[_proj]}"
 
             if gguf_name is None:
                 # [FORK compatibility] Qwen3.5 GGUF multimodal: gguf-py MMPROJ
@@ -573,7 +617,7 @@ class GGUFModelLoader(BaseModelLoader):
             if name == "lm_head.qweight_type":
                 qweight_type = tensor.item()
                 continue
-            if name == "model.embed_tokens.qweight_type":
+            if name.endswith(".embed_tokens.qweight_type"):
                 embed_qwt_type = tensor.item()
                 continue
             if name == "lm_head.qweight":
@@ -588,8 +632,8 @@ class GGUFModelLoader(BaseModelLoader):
                 )
                 tensor = torch.from_numpy(dequant).to(torch.float16)
                 del dequant
-                name = "lm_head.weight"
-            elif name == "model.embed_tokens.qweight":
+                name = "language_model.lm_head.weight"
+            elif name.endswith(".embed_tokens.qweight"):
                 # In llama.cpp, embed = token_embd.weight (Q4_K) and lm_head =
                 # output.weight (Q6_K); the two tables are unrelated (corr~=0).
                 # Previously output.weight was wrongly reused as embed, breaking
@@ -601,7 +645,7 @@ class GGUFModelLoader(BaseModelLoader):
                 )
                 tensor = torch.from_numpy(dequant).to(torch.float16)
                 del dequant
-                name = "model.embed_tokens.weight"
+                name = "language_model.model.embed_tokens.weight"
             elif name.endswith(".linear_attn.conv1d.weight"):
                 # vLLM GDN conv1d is [conv_dim, 1, kernel] (unsqueezed);
                 # GGUF emits 2D [channels, kernel]; insert the middle dim
@@ -619,9 +663,124 @@ class GGUFModelLoader(BaseModelLoader):
     def load_weights(self, model: nn.Module, model_config: ModelConfig) -> None:
         local_model_path = self._prepare_weights(model_config)
         gguf_weights_map = self._get_gguf_weights_map(model_config)
-        model.load_weights(
-            self._get_weights_iterator(model_config, local_model_path, gguf_weights_map)
+        weights = self._get_weights_iterator(
+            model_config, local_model_path, gguf_weights_map
         )
+        # [FORK compatibility] llama.cpp/unsloth convert Qwen3.5 checkpoints
+        # with V heads reordered from the HF grouped layout
+        # [G0v0,G0v1,G0v2,G1v0,...] to a tiled layout
+        # [G0v0,G1v0,...,G0v1,G1v1,...] (see llama.cpp conversion/qwen.py
+        # _reorder_v_heads). vLLM expects the HF grouped layout, so undo the
+        # reorder for GGUF-loaded linear_attn weights; otherwise the value
+        # branch (v/z/a/b/A_log/dt_bias/conv1d/out_proj) is permuted and
+        # generation is garbage even though loading succeeds.
+        weights = self._undo_qwen35_vhead_tiled(weights, model_config)
+        model.load_weights(weights)
+
+    def _undo_qwen35_vhead_tiled(
+        self,
+        weights: Generator[tuple[str, torch.Tensor], None, None],
+        model_config: ModelConfig,
+    ) -> Generator[tuple[str, torch.Tensor], None, None]:
+        """[FORK compatibility] Undo llama.cpp/unsloth V-head tiled layout."""
+        hf_config = getattr(model_config, "hf_config", None)
+        if hf_config is None:
+            yield from weights
+            return
+        text_config = getattr(hf_config, "text_config", None) or hf_config
+        nk = getattr(text_config, "linear_num_key_heads", 0)
+        nv = getattr(text_config, "linear_num_value_heads", 0)
+        hk = getattr(text_config, "linear_key_head_dim", 0)
+        hv = getattr(text_config, "linear_value_head_dim", 0)
+        if nk <= 0 or nv <= 0 or nk == nv:
+            yield from weights
+            return
+        vpk = nv // nk
+
+        def tiled_to_grouped(t, dim, per_head):
+            shape = list(t.shape)
+            if dim < 0:
+                dim += len(shape)
+            new_shape = shape[:dim] + [vpk, nk, per_head] + shape[dim + 1:]
+            t2 = t.reshape(*new_shape)
+            perm = list(range(len(new_shape)))
+            perm[dim], perm[dim + 1] = perm[dim + 1], perm[dim]
+            return t2.permute(*perm).contiguous().reshape(*shape)
+
+        # [FORK compatibility] Qwen3.5 GGUF: llama.cpp/unsloth store the V-head
+        # weights (v/z/a/b/A_log/dt_bias/conv1d-v/out_proj) in a tiled layout
+        # [G0v0,G1v0,...,G0v1,G1v1,...]; vLLM expects the HF grouped layout
+        # [G0v0,G0v1,G0v2,G1v0,...]. The reorder MUST be applied on dequantized
+        # weights: quantized GGUF blocks are row-packed (e.g. Q6_K packs 256
+        # rows), so reordering raw bytes corrupts the block structure. We
+        # dequantize here (CPU), reorder, and hand the fp16 result to the model
+        # as UNQUANTIZED weights (qweight_type -> F16).
+        qtypes: dict[str, int] = {}  # qweight name -> GGMLQuantizationType
+        for name, tensor in weights:
+            if ".linear_attn." not in name:
+                yield name, tensor
+                continue
+            if name.endswith(".qweight_type"):
+                qtypes[name.replace(".qweight_type", ".qweight")] = int(tensor)
+                yield name, torch.tensor(1)  # GGMLQuantizationType.F16
+                continue
+            if name.endswith(".qweight"):
+                qtype = qtypes.get(name)
+                if qtype is not None:
+                    w = gguf_dequantize(
+                        np.asarray(tensor.cpu().numpy(), dtype=np.uint8),
+                        GGUFQuantType(qtype))
+                    t = torch.tensor(np.asarray(w, dtype=np.float32)).half()
+                    if "linear_attn.in_proj_qkv" in name:
+                        q_dim = hk * nk
+                        t = torch.cat(
+                            [t[:q_dim],
+                             t[q_dim:q_dim + hk * nk],
+                             tiled_to_grouped(t[q_dim + hk * nk:], 0, hv)],
+                            dim=0)
+                    elif "linear_attn.in_proj_z" in name:
+                        t = tiled_to_grouped(t, 0, hv)
+                    elif "linear_attn.out_proj" in name:
+                        t = tiled_to_grouped(t, 1, hv)
+                    yield name, t
+                    continue
+                yield name, tensor
+                continue
+            # Non-quantized .weight tensors: reorder rows/cols directly.
+            if "linear_attn.in_proj_qkv" in name:
+                q_dim = hk * nk
+                if tensor.ndim == 2 and tensor.shape[0] >= q_dim * 2 + hv * nv:
+                    tensor = torch.cat(
+                        [tensor[:q_dim],
+                         tensor[q_dim:q_dim + hk * nk],
+                         tiled_to_grouped(tensor[q_dim + hk * nk:], 0, hv)],
+                        dim=0)
+            elif "linear_attn.in_proj_z" in name:
+                if tensor.ndim == 2 and tensor.shape[0] >= hv * nk:
+                    tensor = tiled_to_grouped(tensor, 0, hv)
+            elif ("linear_attn.in_proj_a" in name
+                  or "linear_attn.in_proj_b" in name):
+                if tensor.ndim == 2 and tensor.shape[0] >= nv:
+                    tensor = tiled_to_grouped(tensor, 0, 1)
+            elif ("linear_attn.A_log" in name
+                  or "linear_attn.dt_bias" in name):
+                if tensor.ndim == 1 and tensor.numel() >= nv:
+                    tensor = tiled_to_grouped(
+                        tensor.unsqueeze(-1), 0, 1).squeeze(-1)
+                elif tensor.ndim == 2 and tensor.shape[-1] >= nv:
+                    tensor = tiled_to_grouped(tensor, -1, 1)
+            elif "linear_attn.conv1d" in name:
+                if tensor.ndim >= 2:
+                    qk = hk * nk * 2
+                    if tensor.shape[0] >= qk + hv * nv:
+                        qk_part = tensor[:qk]
+                        v_part = tensor[qk:]
+                        tensor = torch.cat(
+                            [qk_part, tiled_to_grouped(v_part, 0, hv)], dim=0)
+            elif "linear_attn.out_proj" in name:
+                if tensor.ndim == 2 and tensor.shape[1] >= hv * nv:
+                    tensor = tiled_to_grouped(tensor, 1, hv)
+            yield name, tensor
 
     def load_model(
         self, vllm_config: VllmConfig, model_config: ModelConfig, prefix: str = ""

@@ -622,6 +622,12 @@ def maybe_override_with_speculators(
         gguf_model_repo = Path(repo_id)
     else:
         gguf_model_repo = None
+    # [FORK compatibility] GGUF models: transformers >= 5.x
+    # load_gguf_checkpoint cannot parse qwen35 architecture, so reading the
+    # GGUF config here would crash before the GGUF loader ever runs. Skip
+    # speculator probing entirely for GGUF files.
+    if is_gguf(model):
+        return model, tokenizer, vllm_speculative_config
     kwargs["local_files_only"] = huggingface_hub.constants.HF_HUB_OFFLINE
     config_dict, _ = PretrainedConfig.get_config_dict(
         model if gguf_model_repo is None else gguf_model_repo,

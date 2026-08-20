@@ -29,6 +29,7 @@ from collections.abc import Callable, Iterable
 
 import torch
 from torch import nn
+from gguf import GGMLQuantizationType
 
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import VllmConfig
@@ -333,6 +334,45 @@ class Qwen3_5Model(Qwen3NextModel):
             self.config.num_experts if hasattr(self.config, "num_experts") else 0
         )
         for name, loaded_weight in weights:
+            # [FORK compatibility] The GGUF loader feeds state_dict-style
+            # names (model.language_model[.language_model].layers.N...) to
+            # load_weights. Normalize to the params_dict convention
+            # (language_model.layers.N...) so weight matching succeeds.
+            if name.startswith("model."):
+                name = name[len("model."):]
+            while name.startswith("language_model.language_model."):
+                name = name[len("language_model."):]
+            # [FORK compatibility] GGUF loads in_proj_b / in_proj_a (from
+            # ssm_beta / ssm_alpha, stored unquantized so named *.weight)
+            # but the model parameter is the fused in_proj_ba (GGUF quant
+            # naming: *.qweight). Route the shards onto in_proj_ba.qweight.
+            if (".linear_attn.in_proj_b" in name
+                    or ".linear_attn.in_proj_a" in name):
+                _is_b = ".linear_attn.in_proj_b" in name
+                _target = name.replace(
+                    ".linear_attn.in_proj_b", ".linear_attn.in_proj_ba"
+                ).replace(
+                    ".linear_attn.in_proj_a", ".linear_attn.in_proj_ba"
+                )
+                _target = _target.replace(".weight", ".qweight")
+                if _target in params_dict:
+                    params_dict[_target].weight_loader(
+                        params_dict[_target], loaded_weight, 0 if _is_b else 1
+                    )
+                    # ssm_beta/ssm_alpha are stored unquantized (F16), so the
+                    # GGUF iterator never yields a qweight_type for them; the
+                    # fused in_proj_ba shard type map stays empty and crashes
+                    # in GGUFLinearMethod.apply. Stamp the F16 shard types.
+                    _qwt = params_dict.get(
+                        _target.replace(".qweight", ".qweight_type")
+                    )
+                    if _qwt is not None and getattr(
+                        _qwt, "is_gguf_weight_type", False
+                    ):
+                        _qwt.shard_weight_type[0 if _is_b else 1] = (
+                            GGMLQuantizationType.F16
+                        )
+                    continue
             if "rotary_emb.inv_freq" in name:
                 continue
 

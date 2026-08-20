@@ -212,6 +212,10 @@ def _fused_mul_mat_gguf(
         return torch.empty(x.shape[0], qweight.shape[0], dtype=x.dtype, device=x.device)
     # there is no need to call any kernel for fp16/bf16
     if qweight_type in UNQUANTIZED_TYPES:
+        # [FORK compatibility] GGUF F32 linear weights (e.g. Qwen3.5 GDN
+        # ssm_beta/ssm_alpha) must match the activation dtype for matmul.
+        if qweight.dtype != x.dtype:
+            qweight = qweight.to(x.dtype)
         return x @ qweight.T
     # GDN precision fix: force fp32 dequant computation (skips the precision
     # loss of the MMQ fp16 kernel)
